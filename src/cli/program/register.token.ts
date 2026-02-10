@@ -1,5 +1,11 @@
 import type { Command } from "commander";
-import { tokenGenerateCommand, tokenShowCommand } from "../../commands/token.js";
+import {
+  tokenGenerateCommand,
+  tokenShowCommand,
+  setupTokenAddCommand,
+  setupTokenListCommand,
+  setupTokenRemoveCommand,
+} from "../../commands/token.js";
 import { defaultRuntime } from "../../runtime.js";
 import { formatDocsLink } from "../../terminal/links.js";
 import { theme } from "../../terminal/theme.js";
@@ -45,6 +51,60 @@ export function registerTokenCommand(program: Command) {
     .action(async (opts) => {
       await runCommandWithRuntime(defaultRuntime, async () => {
         await tokenShowCommand(
+          {
+            json: Boolean(opts.json),
+          },
+          defaultRuntime,
+        );
+      });
+    });
+
+  // Setup token management commands
+  const setup = token
+    .command("setup")
+    .description("Manage Anthropic setup tokens for Claude API access");
+
+  setup
+    .command("add <token>")
+    .description("Add an Anthropic setup token (starts with sk-ant-oat01-)")
+    .option("--name <name>", "Profile name (default: 'default')")
+    .option("--json", "Output as JSON", false)
+    .action(async (tokenValue: string, opts) => {
+      await runCommandWithRuntime(defaultRuntime, async () => {
+        await setupTokenAddCommand(
+          tokenValue,
+          {
+            name: opts.name as string | undefined,
+            json: Boolean(opts.json),
+          },
+          defaultRuntime,
+        );
+      });
+    });
+
+  setup
+    .command("list")
+    .description("List configured Anthropic setup tokens")
+    .option("--json", "Output as JSON", false)
+    .action(async (opts) => {
+      await runCommandWithRuntime(defaultRuntime, async () => {
+        await setupTokenListCommand(
+          {
+            json: Boolean(opts.json),
+          },
+          defaultRuntime,
+        );
+      });
+    });
+
+  setup
+    .command("remove <profile-id>")
+    .description("Remove an Anthropic setup token by profile ID")
+    .option("--json", "Output as JSON", false)
+    .action(async (profileId: string, opts) => {
+      await runCommandWithRuntime(defaultRuntime, async () => {
+        await setupTokenRemoveCommand(
+          profileId,
           {
             json: Boolean(opts.json),
           },
