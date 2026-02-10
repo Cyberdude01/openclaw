@@ -17,6 +17,7 @@ import { registerOnboardCommand } from "./register.onboard.js";
 import { registerSetupCommand } from "./register.setup.js";
 import { registerStatusHealthSessionsCommands } from "./register.status-health-sessions.js";
 import { registerSubCliCommands } from "./register.subclis.js";
+import { registerTokenCommand } from "./register.token.js";
 
 type CommandRegisterParams = {
   program: Command;
@@ -160,6 +161,10 @@ export const commandRegistry: CommandRegistration[] = [
   {
     id: "browser",
     register: ({ program }) => registerBrowserCli(program),
+  },
+  {
+    id: "token",
+    register: ({ program }) => registerTokenCommand(program),
   },
 ];
 
