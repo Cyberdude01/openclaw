@@ -265,6 +265,21 @@ def _clob_to_gamma_market(m: dict) -> dict:
     }
 
 
+def _timestamped_slugs(base_slug: str) -> List[str]:
+    """
+    Polymarket 15-minute events use slugs like 'eth-updown-15m-1772202600'
+    where the suffix is the window's Unix start time (always a multiple of 900 s).
+    Returns slugs for the current, next, and previous windows.
+    """
+    now = int(time.time())
+    current = (now // 900) * 900
+    return [
+        f"{base_slug}-{current}",
+        f"{base_slug}-{current + 900}",   # next window
+        f"{base_slug}-{current - 900}",   # boundary protection
+    ]
+
+
 def _parse_dt(s: Optional[str]) -> Optional[datetime]:
     if not s:
         return None
@@ -293,7 +308,9 @@ def _parse_market(raw: dict, slug: str, symbol: str) -> Optional[MarketInfo]:
     market_id    = str(raw.get("id", ""))
     condition_id = str(raw.get("conditionId", raw.get("condition_id", "")))
     title        = raw.get("question", raw.get("title", "—"))
-    start_str    = raw.get("startDate", raw.get("start_date", ""))
+    # eventStartTime is the actual window start; startDate is the creation date
+    start_str    = (raw.get("eventStartTime") or raw.get("event_start_time")
+                    or raw.get("startDate")   or raw.get("start_date", ""))
     end_str      = raw.get("endDate",   raw.get("end_date",   ""))
     active       = raw.get("active", True)
     closed       = raw.get("closed", False)
@@ -402,26 +419,52 @@ class CollectorAgent:
         markets_raw: List[dict] = []
         source      = ""
 
-        variants = _SLUG_VARIANTS.get(slug, [slug])
-
-        # ── Strategy 1: Gamma event lookup (try each slug variant) ────────────
-        for variant in variants:
-            event = await self._client.fetch_event_by_slug(variant)
-            if event:
-                eid  = str(event.get("id", ""))
-                raw  = await self._client.fetch_markets_for_event(eid)
+        # ── Strategy 0: computed timestamped slugs (most reliable) ───────────
+        # Polymarket slugs: {base}-{window_start_unix}  e.g. eth-updown-15m-1772202600
+        # The suffix is always (unix_ts // 900) * 900.
+        for ts_slug in _timestamped_slugs(slug):
+            event = await self._client.fetch_event_by_slug(ts_slug)
+            if not event:
+                continue
+            # Markets are embedded directly in the event response
+            embedded = event.get("markets", [])
+            if embedded:
+                markets_raw.extend(embedded)
+                if not source:
+                    source = f"timestamped slug '{ts_slug}'"
+            else:
+                # Fallback: fetch via event_id
+                eid = str(event.get("id", ""))
+                raw = await self._client.fetch_markets_for_event(eid)
                 if raw:
-                    markets_raw = raw
-                    source      = f"Gamma event slug '{variant}'"
-                    break
+                    markets_raw.extend(raw)
+                    if not source:
+                        source = f"timestamped slug '{ts_slug}' + event_id"
+
+        # ── Strategy 1: static slug variants via Gamma event lookup ──────────
+        if not markets_raw:
+            for variant in _SLUG_VARIANTS.get(slug, [slug]):
+                event = await self._client.fetch_event_by_slug(variant)
+                if event:
+                    embedded = event.get("markets", [])
+                    if embedded:
+                        markets_raw = embedded
+                        source      = f"static event slug '{variant}'"
+                        break
+                    eid = str(event.get("id", ""))
+                    raw = await self._client.fetch_markets_for_event(eid)
+                    if raw:
+                        markets_raw = raw
+                        source      = f"static event slug '{variant}'"
+                        break
 
         # ── Strategy 2: direct Gamma market slug search ───────────────────────
         if not markets_raw:
-            for variant in variants:
+            for variant in _SLUG_VARIANTS.get(slug, [slug]):
                 raw = await self._client.fetch_markets_by_slug(variant)
                 if raw:
                     markets_raw = raw
-                    source      = f"Gamma direct slug '{variant}'"
+                    source      = f"direct slug '{variant}'"
                     break
 
         # ── Strategy 3: CLOB API keyword search ──────────────────────────────
@@ -434,7 +477,7 @@ class CollectorAgent:
         if markets_raw:
             console.log(f"[green]{slug}: {len(markets_raw)} raw markets via {source}[/green]")
         else:
-            console.log(f"[red]{slug}: all three discovery strategies failed[/red]")
+            console.log(f"[red]{slug}: all discovery strategies failed[/red]")
             return
 
         parsed = []
