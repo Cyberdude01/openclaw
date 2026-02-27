@@ -55,10 +55,13 @@ async def main(data_only: bool = False, paper: bool = False):
 
     if data_only:
         console.print("[dim]Running in data-only mode (no trading agents)[/dim]")
-        await asyncio.gather(
-            collector.run(),
-            run_display(state),
-        )
+        try:
+            await asyncio.gather(
+                collector.run(),
+                run_display(state),
+            )
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            pass
         return
 
     # ── Agent 2: Decision Engine ───────────────────────────────────────────────
@@ -82,7 +85,7 @@ async def main(data_only: bool = False, paper: bool = False):
             trader.run(),
             run_display(state),
         )
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, asyncio.CancelledError):
         pass
     finally:
         trader.print_summary()

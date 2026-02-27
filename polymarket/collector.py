@@ -148,9 +148,21 @@ class PolymarketClient:
         """Fetch all markets belonging to an event."""
         data = await self._get(
             f"{GAMMA_API}/markets",
-            params={"event_id": event_id, "limit": 10, "order": "startDate", "ascending": "false"},
+            params={"event_id": event_id, "limit": 20},
         )
         return data if isinstance(data, list) else []
+
+    async def fetch_markets_by_slug(self, slug: str) -> List[dict]:
+        """Fallback: search for markets directly by slug when event lookup fails."""
+        data = await self._get(
+            f"{GAMMA_API}/markets",
+            params={"slug": slug, "limit": 5},
+        )
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict) and "markets" in data:
+            return data["markets"]
+        return []
 
     async def fetch_order_book(self, token_id: str) -> Optional[dict]:
         return await self._get(f"{CLOB_API}/book", params={"token_id": token_id})
@@ -318,20 +330,33 @@ class CollectorAgent:
 
     async def _discover_markets(self, slug: str):
         symbol = SYMBOL_MAP.get(slug, slug.upper())
-        event  = await self._client.fetch_event_by_slug(slug)
-        if not event:
-            console.log(f"[yellow]No event found for slug: {slug}[/yellow]")
+        markets_raw: List[dict] = []
+
+        # ── Step 1: event-based lookup ────────────────────────────────────────
+        event = await self._client.fetch_event_by_slug(slug)
+        if event:
+            event_id    = str(event.get("id", ""))
+            markets_raw = await self._client.fetch_markets_for_event(event_id)
+            console.log(f"[dim]{slug}: event found ({event_id}), {len(markets_raw)} markets[/dim]")
+        else:
+            console.log(f"[yellow]{slug}: no event found — trying direct market search[/yellow]")
+
+        # ── Step 2: direct slug fallback if event lookup returned nothing ─────
+        if not markets_raw:
+            markets_raw = await self._client.fetch_markets_by_slug(slug)
+            console.log(f"[dim]{slug}: direct slug search returned {len(markets_raw)} markets[/dim]")
+
+        if not markets_raw:
+            console.log(f"[red]{slug}: no markets found via any method[/red]")
             return
 
-        event_id = str(event.get("id", ""))
-        markets_raw = await self._client.fetch_markets_for_event(event_id)
-
-        now = datetime.now(timezone.utc)
         parsed = []
         for raw in markets_raw:
             mkt = _parse_market(raw, slug, symbol)
             if mkt and mkt.status != MarketStatus.EXPIRED:
                 parsed.append(mkt)
+
+        console.log(f"[dim]{slug}: {len(parsed)} active/upcoming markets after filtering[/dim]")
 
         # Sort by start time; keep current + next
         parsed.sort(key=lambda m: m.start_time)
@@ -755,6 +780,11 @@ async def run_display(state: MarketState):
         while True:
             try:
                 live.update(build_dashboard(state))
+            except asyncio.CancelledError:
+                raise
             except Exception:
                 pass
-            await asyncio.sleep(DISPLAY_REFRESH_SEC)
+            try:
+                await asyncio.sleep(DISPLAY_REFRESH_SEC)
+            except asyncio.CancelledError:
+                break  # clean exit on shutdown
