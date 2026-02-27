@@ -164,6 +164,35 @@ class PolymarketClient:
             return data["markets"]
         return []
 
+    async def search_clob_markets(self, symbol: str) -> List[dict]:
+        """
+        Last-resort: page the CLOB /markets endpoint and return raw CLOB dicts
+        whose question contains the symbol name and a 15-minute hint.
+        """
+        sym = symbol.upper()
+        cursor = ""
+        for _ in range(30):              # cap pages to avoid indefinite loop
+            params: dict = {}
+            if cursor:
+                params["next_cursor"] = cursor
+            data = await self._get(f"{CLOB_API}/markets", params=params)
+            if not isinstance(data, dict):
+                break
+            page: List[dict] = data.get("data", [])
+            matches = []
+            for m in page:
+                if not m.get("active"):
+                    continue
+                q = (m.get("question", "") or "").upper()
+                if sym in q and "15" in q:
+                    matches.append(m)
+            if matches:
+                return matches
+            cursor = data.get("next_cursor", "")
+            if not cursor or not page:
+                break
+        return []
+
     async def fetch_order_book(self, token_id: str) -> Optional[dict]:
         return await self._get(f"{CLOB_API}/book", params={"token_id": token_id})
 
@@ -195,6 +224,46 @@ class PolymarketClient:
 
 
 # ─── Market Discovery ─────────────────────────────────────────────────────────
+
+# Slug variants tried in order per symbol; add more if Polymarket renames slugs
+_SLUG_VARIANTS: Dict[str, List[str]] = {
+    "btc-updown-15m": ["btc-updown-15m", "bitcoin-updown-15m", "btc-15m", "bitcoin-15m"],
+    "eth-updown-15m": ["eth-updown-15m", "ethereum-updown-15m", "eth-15m", "ethereum-15m"],
+    "sol-updown-15m": ["sol-updown-15m", "solana-updown-15m",   "sol-15m", "solana-15m"],
+    "xrp-updown-15m": ["xrp-updown-15m", "ripple-updown-15m",   "xrp-15m", "ripple-15m"],
+}
+
+
+def _clob_to_gamma_market(m: dict) -> dict:
+    """
+    Convert a CLOB /markets item into the dict shape expected by _parse_market().
+    CLOB outcomes are often 'Yes'/'No'; _parse_market already handles those.
+    If game_start_time is absent the start is inferred as end_date - 15 min.
+    """
+    tokens   = m.get("tokens", [])
+    end_iso  = m.get("end_date_iso", "")
+    start_iso = m.get("game_start_time") or ""
+    if not start_iso and end_iso:
+        try:
+            end_dt    = datetime.fromisoformat(end_iso.replace("Z", "+00:00"))
+            start_iso = (end_dt - timedelta(minutes=15)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        except Exception:
+            start_iso = end_iso
+    return {
+        "id":            m.get("condition_id", ""),
+        "conditionId":   m.get("condition_id", ""),
+        "question":      m.get("question", ""),
+        "startDate":     start_iso,
+        "endDate":       end_iso,
+        "active":        m.get("active", True),
+        "closed":        m.get("closed", False),
+        "clobTokenIds":  json.dumps([t.get("token_id", "") for t in tokens]),
+        "outcomes":      json.dumps([t.get("outcome", "") for t in tokens]),
+        "outcomePrices": json.dumps([0.5] * len(tokens)),
+        "volume":        0,
+        "liquidity":     0,
+    }
+
 
 def _parse_dt(s: Optional[str]) -> Optional[datetime]:
     if not s:
@@ -329,25 +398,43 @@ class CollectorAgent:
     # ── Market Discovery ──────────────────────────────────────────────────────
 
     async def _discover_markets(self, slug: str):
-        symbol = SYMBOL_MAP.get(slug, slug.upper())
+        symbol      = SYMBOL_MAP.get(slug, slug.upper())
         markets_raw: List[dict] = []
+        source      = ""
 
-        # ── Step 1: event-based lookup ────────────────────────────────────────
-        event = await self._client.fetch_event_by_slug(slug)
-        if event:
-            event_id    = str(event.get("id", ""))
-            markets_raw = await self._client.fetch_markets_for_event(event_id)
-            console.log(f"[dim]{slug}: event found ({event_id}), {len(markets_raw)} markets[/dim]")
+        variants = _SLUG_VARIANTS.get(slug, [slug])
+
+        # ── Strategy 1: Gamma event lookup (try each slug variant) ────────────
+        for variant in variants:
+            event = await self._client.fetch_event_by_slug(variant)
+            if event:
+                eid  = str(event.get("id", ""))
+                raw  = await self._client.fetch_markets_for_event(eid)
+                if raw:
+                    markets_raw = raw
+                    source      = f"Gamma event slug '{variant}'"
+                    break
+
+        # ── Strategy 2: direct Gamma market slug search ───────────────────────
+        if not markets_raw:
+            for variant in variants:
+                raw = await self._client.fetch_markets_by_slug(variant)
+                if raw:
+                    markets_raw = raw
+                    source      = f"Gamma direct slug '{variant}'"
+                    break
+
+        # ── Strategy 3: CLOB API keyword search ──────────────────────────────
+        if not markets_raw:
+            clob_hits = await self._client.search_clob_markets(symbol)
+            if clob_hits:
+                markets_raw = [_clob_to_gamma_market(m) for m in clob_hits]
+                source      = f"CLOB keyword search ({len(clob_hits)} hit(s))"
+
+        if markets_raw:
+            console.log(f"[green]{slug}: {len(markets_raw)} raw markets via {source}[/green]")
         else:
-            console.log(f"[yellow]{slug}: no event found — trying direct market search[/yellow]")
-
-        # ── Step 2: direct slug fallback if event lookup returned nothing ─────
-        if not markets_raw:
-            markets_raw = await self._client.fetch_markets_by_slug(slug)
-            console.log(f"[dim]{slug}: direct slug search returned {len(markets_raw)} markets[/dim]")
-
-        if not markets_raw:
-            console.log(f"[red]{slug}: no markets found via any method[/red]")
+            console.log(f"[red]{slug}: all three discovery strategies failed[/red]")
             return
 
         parsed = []
@@ -356,7 +443,7 @@ class CollectorAgent:
             if mkt and mkt.status != MarketStatus.EXPIRED:
                 parsed.append(mkt)
 
-        console.log(f"[dim]{slug}: {len(parsed)} active/upcoming markets after filtering[/dim]")
+        console.log(f"[dim]{slug}: {len(parsed)} active/upcoming after expiry filter[/dim]")
 
         # Sort by start time; keep current + next
         parsed.sort(key=lambda m: m.start_time)
