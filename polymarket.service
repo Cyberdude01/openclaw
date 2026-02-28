@@ -1,0 +1,21 @@
+[Unit]
+Description=Polymarket 15M Crypto Market System
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root
+Environment="GITHUB_TOKEN=REPLACE_ME"
+Environment="EXPORT_REPO=https://github.com/Cyberdude01/Bob.git"
+Environment="EXPORT_INTERVAL=300"
+ExecStart=/root/venv/bin/python -m polymarket
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=polymarket
+
+[Install]
+WantedBy=multi-user.target

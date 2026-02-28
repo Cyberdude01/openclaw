@@ -16,9 +16,10 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Deque, Dict, List, Optional
 
 from .analytics import AnalyticsRegistry
 from .collector import MarketState
@@ -137,8 +138,9 @@ class DecisionEngine:
     """
 
     def __init__(self, state: MarketState, book: PositionBook):
-        self.state = state
-        self.book  = book
+        self.state      = state
+        self.book       = book
+        self.signal_log: Deque[TradeSignal] = deque(maxlen=50)
 
     def generate_signals(self) -> List[TradeSignal]:
         signals: List[TradeSignal] = []
@@ -316,5 +318,6 @@ class DecisionEngine:
         while True:
             signals = self.generate_signals()
             for sig in signals:
+                self.signal_log.append(sig)
                 await signal_queue.put(sig)
             await asyncio.sleep(interval)

@@ -880,7 +880,54 @@ def build_probability_summary(state: MarketState) -> Panel:
     return Panel("\n".join(lines), title="Probability Model", border_style="magenta")
 
 
-def build_dashboard(state: MarketState) -> Layout:
+def build_pipeline_panel(signal_log=None, exec_log=None, book=None) -> Panel:
+    """Compact panel: mode indicator, recent signals, recent fills, PnL."""
+    lines: List[str] = []
+
+    # ── Mode + PnL header ─────────────────────────────────────────────────────
+    if book is not None:
+        from .config import POLY_API_KEY
+        mode_tag = "[green]● LIVE[/green]" if POLY_API_KEY else "[yellow]● PAPER[/yellow]"
+        lines.append(
+            f"{mode_tag}  Balance: [bold]${book.balance:.2f}[/bold]  "
+            f"Realized P&L: [bold cyan]${book.realized_pnl:.4f}[/bold cyan]"
+        )
+    else:
+        lines.append("[dim]Trading agents inactive — run without --data-only to enable[/dim]")
+
+    # ── Recent signals ─────────────────────────────────────────────────────────
+    sigs = list(signal_log)[-5:] if signal_log else []
+    if sigs:
+        lines.append("\n[bold]Signals (last 5):[/bold]")
+        for s in reversed(sigs):
+            col = "green" if s.outcome.value == "UP" else "red"
+            lines.append(
+                f"  [{col}]{s.symbol}/{s.outcome.value}[/{col}]  "
+                f"conf={s.confidence:.2f}  size=${s.size:.1f}  [{s.reason[:55]}]"
+            )
+    else:
+        lines.append("\n[dim]No signals yet[/dim]")
+
+    # ── Recent fills ───────────────────────────────────────────────────────────
+    fills = list(exec_log)[-5:] if exec_log else []
+    if fills:
+        lines.append("\n[bold]Fills (last 5):[/bold]")
+        for f in reversed(fills):
+            m_col = "green" if f.get("mode") == "live" else "yellow"
+            o_col = "green" if f.get("outcome") == "UP" else "red"
+            lines.append(
+                f"  [{m_col}]{f.get('mode','?').upper()}[/{m_col}]  "
+                f"[{o_col}]{f.get('symbol','')}/{f.get('outcome','')}[/{o_col}]  "
+                f"{f.get('side','')} ${f.get('size',0):.2f} @ {f.get('price',0):.4f}  "
+                f"conf={f.get('confidence',0):.2f}"
+            )
+    else:
+        lines.append("[dim]No fills yet[/dim]")
+
+    return Panel("\n".join(lines), title="Trading Pipeline", border_style="green")
+
+
+def build_dashboard(state: MarketState, signal_log=None, exec_log=None, book=None) -> Layout:
     """Compose the full terminal dashboard."""
     now    = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     ws_ind = "[green]●[/green] WS Live" if state.ws_connected else "[red]○[/red] WS Offline"
@@ -894,22 +941,23 @@ def build_dashboard(state: MarketState) -> Layout:
 
     layout = Layout()
     layout.split_column(
-        Layout(header,                          name="header",  size=3),
-        Layout(build_market_table(state),       name="market",  ratio=3),
-        Layout(build_analytics_table(state),    name="analytics", ratio=2),
-        Layout(build_probability_summary(state),name="probab",  size=8),
+        Layout(header,                          name="header",   size=3),
+        Layout(build_market_table(state),       name="market",   ratio=3),
+        Layout(build_analytics_table(state),    name="analytics",ratio=2),
+        Layout(build_probability_summary(state),name="probab",   size=8),
+        Layout(build_pipeline_panel(signal_log, exec_log, book), name="pipeline", size=12),
     )
     return layout
 
 
 # ─── Display Runner ───────────────────────────────────────────────────────────
 
-async def run_display(state: MarketState):
+async def run_display(state: MarketState, signal_log=None, exec_log=None, book=None):
     """Render the live dashboard, refreshing every DISPLAY_REFRESH_SEC."""
     with Live(console=console, refresh_per_second=1 / DISPLAY_REFRESH_SEC, screen=True) as live:
         while True:
             try:
-                live.update(build_dashboard(state))
+                live.update(build_dashboard(state, signal_log=signal_log, exec_log=exec_log, book=book))
             except asyncio.CancelledError:
                 raise
             except Exception:
