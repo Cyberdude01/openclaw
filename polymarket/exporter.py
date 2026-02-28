@@ -47,7 +47,9 @@ def _git(args: List[str], **kw) -> bool:
     try:
         subprocess.run(["git"] + args, check=True, capture_output=True, cwd=EXPORT_DIR, **kw)
         return True
-    except subprocess.CalledProcessError:
+    except subprocess.CalledProcessError as exc:
+        stderr = exc.stderr.decode(errors="replace").strip() if exc.stderr else ""
+        console.log(f"[red]Exporter git error (git {args[0]}): {stderr[:300]}[/red]")
         return False
 
 
