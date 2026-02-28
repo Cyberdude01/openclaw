@@ -122,7 +122,14 @@ class OrderBuilder:
     def __init__(self, private_key: str, address: str):
         self._key     = private_key
         self._address = address
-        self._account = Account.from_key(private_key) if private_key else None
+        try:
+            self._account = Account.from_key(private_key) if private_key else None
+        except Exception:
+            import logging
+            logging.getLogger(__name__).warning(
+                "POLY_PRIVATE_KEY is set but invalid — falling back to paper-trade mode."
+            )
+            self._account = None
 
     def _to_usdc_units(self, amount: float) -> int:
         return int(round(amount * 10 ** self.USDC_DECIMALS))
