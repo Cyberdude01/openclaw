@@ -55,13 +55,20 @@ if not ok:
 
 # ── Create / reuse venv ───────────────────────────────────────────────────────
 venv_dir = pathlib.Path.home() / "venv"
-if not (venv_dir / "bin" / "python").exists():
+# Debian/Ubuntu venvs may only have 'python3', not 'python'
+_py = venv_dir / "bin" / "python"
+_py3 = venv_dir / "bin" / "python3"
+if not (_py.exists() or _py3.exists()):
     print(f"\nCreating virtual environment at {venv_dir} …")
     _venv.create(str(venv_dir), with_pip=True)
 else:
     print(f"\nReusing existing venv at {venv_dir}")
 
-venv_python = str(venv_dir / "bin" / "python")
+venv_python = str(_py if _py.exists() else _py3)
+
+# Ensure pip is present inside the venv (some distros strip it)
+subprocess.check_call([venv_python, "-m", "ensurepip", "--upgrade"],
+    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 print("Installing dependencies into venv…")
 subprocess.check_call([venv_python, "-m", "pip", "install", "--quiet",
