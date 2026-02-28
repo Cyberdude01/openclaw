@@ -23,6 +23,7 @@ FILES = [
     "collector.py",
     "decision.py",
     "trader.py",
+    "exporter.py",
     "main.py",
     "requirements.txt",
 ]
