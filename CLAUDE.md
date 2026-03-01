@@ -16,6 +16,9 @@ Key files on the server:
 - `/etc/polymarket.env` — environment variables (GITHUB_TOKEN, EXPORT_REPO, etc.)
 - `~/bob` — local git clone of the export repo (Cyberdude01/Bob)
 
+**`/root/polymarket` is NOT a git repository** — files are deployed directly.
+To apply fixes, patch the files in-place (e.g. with a Python script) then restart the service.
+
 The local dev repo is at `/home/user/openclaw/` (this repo).
 
 ## Service
