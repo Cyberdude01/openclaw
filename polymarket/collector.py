@@ -96,11 +96,15 @@ class MarketState:
                     engine = self.analytics.get(symbol)
                     if mkt.up_token and mkt.up_token.token_id == token_id:
                         mkt.up_token.order_book = ob
-                        mkt.up_token.price = ob.mid_price
-                        engine.add_price(ob.timestamp, ob.mid_price)
+                        mid = ob.mid_price
+                        if mid > 0:
+                            mkt.up_token.price = mid
+                            engine.add_price(ob.timestamp, mid)
                     elif mkt.down_token and mkt.down_token.token_id == token_id:
                         mkt.down_token.order_book = ob
-                        mkt.down_token.price = ob.mid_price
+                        mid = ob.mid_price
+                        if mid > 0:
+                            mkt.down_token.price = mid
 
     def get_current_market(self, slug: str) -> Optional[MarketInfo]:
         markets = self.markets.get(slug, [])

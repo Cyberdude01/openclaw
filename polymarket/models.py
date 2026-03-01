@@ -58,7 +58,12 @@ class OrderBook:
     @property
     def mid_price(self) -> float:
         if self.bids and self.asks:
-            return (self.best_bid + self.best_ask) / 2
+            mid = (self.best_bid + self.best_ask) / 2
+            # Wide spread (>0.5) means the order book is stale or the market is
+            # near expiry with stranded orders — use last_trade_price instead.
+            if self.spread > 0.5 and self.last_trade_price > 0:
+                return self.last_trade_price
+            return mid
         return self.last_trade_price
 
     @property
