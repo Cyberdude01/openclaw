@@ -2,6 +2,7 @@
 Polymarket 15M Crypto Market Collector - Configuration
 """
 import os
+from pathlib import Path
 
 # ─── API Endpoints ────────────────────────────────────────────────────────────
 GAMMA_API     = "https://gamma-api.polymarket.com"
@@ -64,3 +65,14 @@ WS_RECONNECT_SEC    = 3             # WebSocket reconnect delay
 
 # ─── Display ──────────────────────────────────────────────────────────────────
 DISPLAY_REFRESH_SEC = 1.0           # Terminal table refresh rate
+
+# ─── Database ─────────────────────────────────────────────────────────────────
+DB_PATH            = Path(os.getenv("DB_PATH", Path.home() / "polymarket.db"))
+DB_RETENTION_HOURS = int(os.getenv("DB_RETENTION_HOURS", "36"))  # 24-48h window
+DB_TRIM_INTERVAL   = 3600    # Trim stale rows once per hour
+SNAPSHOT_INTERVAL  = 60      # Write market snapshot to DB every 60 seconds
+
+# ─── Auto-restart ─────────────────────────────────────────────────────────────
+# Set AUTO_RESTART_HOURS=24 in environment to auto-restart the process daily.
+# 0 disables the feature (default).
+AUTO_RESTART_HOURS = float(os.getenv("AUTO_RESTART_HOURS", "0"))

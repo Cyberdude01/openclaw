@@ -51,6 +51,7 @@ from .config import (
     POLY_API_SECRET,
     POLY_PRIVATE_KEY,
 )
+from .database import Database
 from .decision import PositionBook
 from .models import Side, TradeSignal
 
@@ -244,10 +245,12 @@ class TraderAgent:
         state:  MarketState,
         book:   PositionBook,
         signal_queue: asyncio.Queue,
+        db: Optional[Database] = None,
     ):
         self.state  = state
         self.book   = book
         self._queue = signal_queue
+        self.db     = db
         self._live  = bool(POLY_PRIVATE_KEY and POLY_API_KEY)
         self._builder: Optional[OrderBuilder] = None
         self._log: List[dict] = []    # in-memory execution log
@@ -304,20 +307,45 @@ class TraderAgent:
             fill_price = signal.price
 
         # Record
+        ts    = datetime.now(timezone.utc).isoformat()
+        mode  = "live" if self._live else "paper"
+        order_id = (result or {}).get("orderId", "")
         entry = {
-            "ts":         datetime.now(timezone.utc).isoformat(),
+            "ts":         ts,
             "symbol":     signal.symbol,
             "outcome":    signal.outcome.value,
             "side":       signal.side.value,
             "size":       signal.size,
             "price":      fill_price,
             "confidence": signal.confidence,
+            "trigger":    signal.trigger,
             "reason":     signal.reason,
             "result":     result,
-            "mode":       "live" if self._live else "paper",
+            "mode":       mode,
         }
         self._log.append(entry)
         self.book.record_fill(signal, fill_price)
+
+        # Persist to SQLite
+        if self.db:
+            try:
+                self.db.insert_trade({
+                    "ts":           ts,
+                    "symbol":       signal.symbol,
+                    "condition_id": signal.condition_id,
+                    "token_id":     signal.token_id,
+                    "outcome":      signal.outcome.value,
+                    "side":         signal.side.value,
+                    "size":         signal.size,
+                    "entry_price":  fill_price,
+                    "confidence":   signal.confidence,
+                    "trigger":      signal.trigger,
+                    "reasoning":    signal.reason,
+                    "mode":         mode,
+                    "order_id":     order_id,
+                })
+            except Exception:
+                pass  # Never let DB errors interrupt execution
 
         # Console log
         from rich.console import Console

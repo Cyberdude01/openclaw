@@ -244,5 +244,6 @@ class TradeSignal:
     size:        float        # USDC size
     price:       float        # limit price
     confidence:  float        # 0.5 – 1.0
-    reason:      str
+    reason:      str          # Human-readable explanation of why this signal fired
+    trigger:     str = ""     # Machine tag: arb | directional_60pct | directional_80pct | directional_90pct | trend_follow
     timestamp:   float = field(default_factory=lambda: datetime.now(timezone.utc).timestamp())

@@ -35,6 +35,7 @@ from .config import (
     SLUGS,
     SYMBOL_MAP,
 )
+from .database import Database
 from .models import (
     AnalyticsSnapshot,
     MarketInfo,
@@ -137,9 +138,10 @@ class DecisionEngine:
        enter in the direction of the trend regardless of timing threshold.
     """
 
-    def __init__(self, state: MarketState, book: PositionBook):
+    def __init__(self, state: MarketState, book: PositionBook, db: Optional[Database] = None):
         self.state      = state
         self.book       = book
+        self.db         = db
         self.signal_log: Deque[TradeSignal] = deque(maxlen=50)
 
     def generate_signals(self) -> List[TradeSignal]:
@@ -190,7 +192,13 @@ class DecisionEngine:
                     size         = size,
                     price        = price,
                     confidence   = 0.99,
-                    reason       = f"ARB: UP+DOWN={cost_per_contract:.4f} < {ARB_THRESHOLD}",
+                    trigger      = "arb",
+                    reason       = (
+                        f"ARBITRAGE — both legs cost {cost_per_contract:.4f} total "
+                        f"(threshold {ARB_THRESHOLD}), guaranteeing "
+                        f"{1.0 - cost_per_contract:.4f} profit per dollar. "
+                        f"Buying {outcome.value} leg @ {price:.4f}."
+                    ),
                 ))
         return signals
 
@@ -239,6 +247,7 @@ class DecisionEngine:
             if size < MIN_TRADE_SIZE:
                 continue
 
+            direction_word = "UP" if prob_up > 0.5 else "DOWN"
             signals.append(TradeSignal(
                 symbol       = symbol,
                 market_id    = mkt.market_id,
@@ -249,9 +258,13 @@ class DecisionEngine:
                 size         = round(size, 2),
                 price        = round(price, 4),
                 confidence   = round(confidence, 3),
+                trigger      = f"directional_{label}",
                 reason       = (
-                    f"{label} trigger: P(UP)={prob_up:.3f}  "
-                    f"bucket={snap.vol_bucket.value}+{snap.trend_bucket.value}"
+                    f"DIRECTIONAL at {label} ({pct*100:.0f}% elapsed) — "
+                    f"P(UP)={prob_up:.3f} gives edge={edge:.3f} toward {direction_word}. "
+                    f"Bucket={snap.vol_bucket.value}+{snap.trend_bucket.value} "
+                    f"(RV60={snap.rv60:.5f}, Eff60={snap.eff60:.3f}). "
+                    f"Size scales with edge: ${round(size, 2):.2f} USDC @ conf={round(confidence, 3):.3f}."
                 ),
             ))
         return signals
@@ -304,7 +317,13 @@ class DecisionEngine:
                 size         = round(size, 2),
                 price        = round(price, 4),
                 confidence   = round(0.50 + dev, 3),
-                reason       = f"HighVol+Trend momentum: {outcome.value} price={price:.3f}",
+                trigger      = "trend_follow",
+                reason       = (
+                    f"TREND FOLLOW (HighVol+Trend, {mkt.elapsed_pct*100:.0f}% elapsed) — "
+                    f"{outcome.value} token at {price:.3f} deviates {dev:.3f} from 0.50. "
+                    f"Momentum continuation strategy: buying the already-winning leg. "
+                    f"Size=${round(size, 2):.2f} USDC (scales with deviation)."
+                ),
             ))
         return signals
 
@@ -312,12 +331,38 @@ class DecisionEngine:
 
     async def run(self, signal_queue: asyncio.Queue, interval: float = 2.0):
         """
-        Continuously generate signals and push them to the queue.
-        The trader agent consumes from this queue.
+        Continuously generate signals, push them to the trader queue,
+        and persist them to the database.
         """
         while True:
             signals = self.generate_signals()
             for sig in signals:
                 self.signal_log.append(sig)
                 await signal_queue.put(sig)
+                if self.db:
+                    try:
+                        # Fetch analytics snapshot for extra context
+                        snap = self.state.analytics.get(sig.symbol).last_snapshot
+                        slug = next((k for k, v in SYMBOL_MAP.items() if v == sig.symbol), None)
+                        mkt  = self.state.get_current_market(slug) if slug else None
+                        self.db.insert_signal({
+                            "ts":           datetime.now(timezone.utc).isoformat(),
+                            "symbol":       sig.symbol,
+                            "condition_id": sig.condition_id,
+                            "token_id":     sig.token_id,
+                            "outcome":      sig.outcome.value,
+                            "side":         sig.side.value,
+                            "size":         sig.size,
+                            "price":        sig.price,
+                            "confidence":   sig.confidence,
+                            "trigger":      sig.trigger,
+                            "reasoning":    sig.reason,
+                            "vol_bucket":   snap.vol_bucket.value   if snap else None,
+                            "trend_bucket": snap.trend_bucket.value if snap else None,
+                            "prob_up":      snap.dir_60pct          if snap else None,
+                            "elapsed_pct":  mkt.elapsed_pct         if mkt  else None,
+                            "arb_profit":   mkt.arb_opportunity      if mkt  else None,
+                        })
+                    except Exception:
+                        pass  # Never let DB errors interrupt signal flow
             await asyncio.sleep(interval)
