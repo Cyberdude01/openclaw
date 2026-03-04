@@ -241,13 +241,18 @@ class DataExporter:
         ]
 
         for r in rows:
-            slug = _SLUG_FOR.get(r["symbol"], r["symbol"])
+            slug  = _SLUG_FOR.get(r["symbol"], r["symbol"])
+            up_p  = r["up_price"]
+            dn_p  = r["down_price"]
+            # Correct rows where DOWN was stored as the same as UP (stale OB)
+            if up_p is not None and dn_p is not None and abs(up_p - dn_p) < 0.005:
+                dn_p = round(1.0 - up_p, 4)
             cells = [
                 f"`{_to_et(r['ts'])}`",
                 r["symbol"] or "—",
                 slug,
-                _price(r["up_price"]),
-                _price(r["down_price"]),
+                _price(up_p),
+                _price(dn_p),
                 _price(r["up_spread"]),
                 _price(r["down_spread"]),
                 _pct(r["elapsed_pct"]),

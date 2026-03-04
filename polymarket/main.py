@@ -50,11 +50,13 @@ import sys
 from datetime import datetime, timezone
 from typing import Optional
 
+import aiohttp
 from rich.console import Console
 
 from .collector import CollectorAgent, MarketState, run_display
 from .config import (
     AUTO_RESTART_HOURS,
+    DATA_API,
     DB_PATH,
     DB_RETENTION_HOURS,
     DB_TRIM_INTERVAL,
@@ -93,15 +95,26 @@ async def _snapshot_loop(state: MarketState, db: Database) -> None:
                 up_ob   = mkt.up_token.order_book   if mkt.up_token   else None
                 dn_ob   = mkt.down_token.order_book if mkt.down_token else None
 
+                # Use analytics snapshot prices (computed from order books) when
+                # available; fall back to token prices only when snap is missing.
+                up_p = (snap.up_price   if snap else None) or \
+                       (mkt.up_token.price   if mkt.up_token   else None)
+                dn_p = (snap.down_price if snap else None) or \
+                       (mkt.down_token.price if mkt.down_token else None)
+                # If DOWN mirrors UP (stale order book), derive it from UP.
+                # In a binary market: UP + DOWN ≈ 1.0
+                if up_p and dn_p and abs(up_p - dn_p) < 0.005:
+                    dn_p = round(1.0 - up_p, 4)
+
                 row = {
                     "ts":               ts,
                     "symbol":           symbol,
                     "condition_id":     mkt.condition_id,
                     "token_id_up":      mkt.up_token.token_id   if mkt.up_token   else None,
                     "token_id_down":    mkt.down_token.token_id if mkt.down_token else None,
-                    # Prices
-                    "up_price":         mkt.up_token.price   if mkt.up_token   else None,
-                    "down_price":       mkt.down_token.price if mkt.down_token else None,
+                    # Prices (corrected)
+                    "up_price":         round(up_p, 4) if up_p else None,
+                    "down_price":       round(dn_p, 4) if dn_p else None,
                     "up_best_bid":      up_ob.best_bid   if up_ob else None,
                     "up_best_ask":      up_ob.best_ask   if up_ob else None,
                     "down_best_bid":    dn_ob.best_bid   if dn_ob else None,
@@ -208,6 +221,106 @@ async def _resolution_loop(state: MarketState, db: Database) -> None:
             console.log(f"[yellow]Resolution loop error: {exc}[/yellow]")
 
 
+async def _api_resolution_loop(db: Database) -> None:
+    """
+    Every 2 minutes, fetch the final settlement price from the Polymarket
+    DATA API for any trades that remain unresolved in SQLite.
+
+    This handles markets that expired after a restart (in-process price state
+    was lost) or whose prices never crossed the state-based thresholds.
+
+    Strategy
+    --------
+    1. Query trades_executed for condition_ids with resolved_at IS NULL
+       that are at least 20 minutes old (market must have expired).
+    2. Look up token_id_up for each condition_id from market_snapshots.
+    3. Call DATA_API /last-trade-price?token_id=<up_token>.
+    4. Price >= 0.90 → UP wins; <= 0.10 → DOWN wins.
+       If older than 30 min and price between 0.10–0.90: take the higher side.
+    """
+    while True:
+        await asyncio.sleep(120)
+        try:
+            rows = db._conn.execute(
+                """
+                SELECT DISTINCT t.condition_id,
+                       t.symbol,
+                       MIN(t.ts)   AS first_trade_ts,
+                       (SELECT s.token_id_up FROM market_snapshots s
+                        WHERE  s.condition_id = t.condition_id
+                          AND  s.token_id_up IS NOT NULL
+                        LIMIT 1)  AS token_id_up
+                FROM   trades_executed t
+                WHERE  t.resolved_at IS NULL
+                GROUP  BY t.condition_id
+                """
+            ).fetchall()
+
+            if not rows:
+                continue
+
+            async with aiohttp.ClientSession() as session:
+                for row in rows:
+                    cid          = row["condition_id"]
+                    symbol       = row["symbol"] or "?"
+                    token_id_up  = row["token_id_up"]
+                    if not token_id_up:
+                        continue
+
+                    # Skip if trade is < 20 min old (market may still be live)
+                    try:
+                        age = (
+                            datetime.now(timezone.utc) -
+                            datetime.fromisoformat(
+                                row["first_trade_ts"].replace("Z", "+00:00")
+                            )
+                        ).total_seconds()
+                    except Exception:
+                        age = 9999
+
+                    if age < 1200:
+                        continue
+
+                    try:
+                        url = f"{DATA_API}/last-trade-price?token_id={token_id_up}"
+                        async with session.get(
+                            url, timeout=aiohttp.ClientTimeout(total=10)
+                        ) as r:
+                            data     = await r.json()
+                            up_price = float(data.get("price", 0))
+
+                        if up_price <= 0:
+                            continue
+
+                        if up_price >= 0.90:
+                            winner = "UP"
+                        elif up_price <= 0.10:
+                            winner = "DOWN"
+                        elif age >= 1800:
+                            # Force-resolve after 30 min: take whichever side is higher
+                            winner = "UP" if up_price >= 0.50 else "DOWN"
+                        else:
+                            continue   # price still ambiguous, wait
+
+                        db.record_resolution(
+                            condition_id     = cid,
+                            symbol           = symbol,
+                            winning_outcome  = winner,
+                            final_up_price   = up_price,
+                            final_down_price = round(1.0 - up_price, 4),
+                        )
+                        console.log(
+                            f"[green]API resolution: {symbol} {cid[:12]}… "
+                            f"→ {winner} (UP={up_price:.4f}, age={age:.0f}s)[/green]"
+                        )
+                    except Exception as exc:
+                        console.log(
+                            f"[yellow]API resolution fetch ({cid[:8]}): {exc}[/yellow]"
+                        )
+        except Exception as exc:
+            console.log(f"[yellow]API resolution loop error: {exc}[/yellow]")
+
+
 async def _trim_loop(db: Database) -> None:
     """Trim old market_snapshots and decision_signals once per hour."""
     while True:
@@ -261,6 +374,8 @@ async def main(data_only: bool = False):
                 run_display(state),
                 exporter.run(),
                 _snapshot_loop(state, db),
+                _resolution_loop(state, db),
+                _api_resolution_loop(db),
                 _trim_loop(db),
                 _auto_restart_loop(AUTO_RESTART_HOURS),
             )
@@ -312,6 +427,7 @@ async def main(data_only: bool = False):
             exporter.run(),
             _snapshot_loop(state, db),
             _resolution_loop(state, db),
+            _api_resolution_loop(db),
             _trim_loop(db),
             _auto_restart_loop(AUTO_RESTART_HOURS),
         )

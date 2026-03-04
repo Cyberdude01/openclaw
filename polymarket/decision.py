@@ -286,13 +286,13 @@ class DecisionEngine:
 
         up_p    = snap.up_price
         down_p  = snap.down_price
-        dev_up  = up_p   - 0.50
-        dev_dn  = down_p - 0.50
+        dev_up  = up_p   - 0.50   # positive when UP  is the winning side (>0.50)
+        dev_dn  = down_p - 0.50   # positive when DOWN is the winning side (>0.50)
 
         signals = []
         for dev, outcome, price_attr in [
-            (dev_up,  Outcome.UP,   "best_ask"),
-            (-dev_dn, Outcome.DOWN, "best_ask"),
+            (dev_up, Outcome.UP,   "best_ask"),
+            (dev_dn, Outcome.DOWN, "best_ask"),   # only fires when DOWN > 0.58
         ]:
             if dev < 0.08:     # need at least 8 cent deviation from 50
                 continue
