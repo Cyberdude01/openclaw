@@ -123,12 +123,11 @@ def _record_resolution(conn: sqlite3.Connection, cid: str, symbol: str,
     """
     Back-fill trades_executed for this condition_id.
 
-    Polymarket binary market P&L:
+    Polymarket binary market P&L (total payout):
       You spend `size` USDC to buy  size / entry_price  tokens.
-      Win:  tokens pay $1 → profit = size / entry_price - size
-                                    = size * (1 - entry_price) / entry_price
-      Loss: entire stake forfeited  → pnl = -size
-      ARB:  same win formula; deduct ~3% round-trip fee
+      Win:  tokens pay $1 → pnl = size / entry_price  (capital + profit)
+      Loss: entire stake forfeited → pnl = -size
+      ARB:  total payout minus ~3% round-trip fee
     """
     now  = datetime.now(timezone.utc).isoformat()
     rows = conn.execute(
@@ -147,10 +146,10 @@ def _record_resolution(conn: sqlite3.Connection, cid: str, symbol: str,
 
         if trigger == "arb":
             result = "arb"
-            pnl    = (1.0 - entry_price - 0.03) / entry_price * size
+            pnl    = size / entry_price - 0.03 * size
         elif outcome == winner:
             result = "positive"
-            pnl    = (1.0 - entry_price) / entry_price * size
+            pnl    = size / entry_price
         else:
             result = "negative"
             pnl    = -size

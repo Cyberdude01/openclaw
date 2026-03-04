@@ -221,13 +221,12 @@ class Database:
         )
         # Back-fill the trades_executed table for this market.
         #
-        # Polymarket binary market P&L:
+        # Polymarket binary market P&L (total payout):
         #   You spend `size` USDC to buy  size / entry_price  tokens.
         #   If you win:  tokens pay $1 each → receive size / entry_price USDC
-        #                net profit = size / entry_price - size
-        #                           = size * (1 - entry_price) / entry_price
+        #                P&L = size / entry_price  (capital + profit returned)
         #   If you lose: you forfeit the entire stake → pnl = -size
-        #   ARB:         same win formula; deduct estimated round-trip fee (3%)
+        #   ARB:         total payout minus estimated round-trip fee (3%)
         self._conn.execute(
             """
             UPDATE trades_executed
@@ -239,8 +238,8 @@ class Database:
                                 ELSE                          'negative'
                               END,
                 pnl         = CASE
-                                WHEN trigger = 'arb'     THEN (1.0 - entry_price - 0.03) / entry_price * size
-                                WHEN outcome = ?         THEN (1.0 - entry_price) / entry_price * size
+                                WHEN trigger = 'arb'     THEN size / entry_price - 0.03 * size
+                                WHEN outcome = ?         THEN size / entry_price
                                 ELSE                          -size
                               END
             WHERE condition_id = ? AND resolved_at IS NULL
