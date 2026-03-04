@@ -220,11 +220,14 @@ class Database:
             [condition_id, symbol, ts, winning_outcome, final_up_price, final_down_price],
         )
         # Back-fill the trades_executed table for this market.
-        # For a straight BUY of the winning side:
-        #   positive → pnl ≈ (1 - entry_price) * size
-        #   negative → pnl ≈ -entry_price * size
-        # For ARB signals both legs are counted individually; the engine already
-        # labels them 'arb' in the trigger column.
+        #
+        # Polymarket binary market P&L:
+        #   You spend `size` USDC to buy  size / entry_price  tokens.
+        #   If you win:  tokens pay $1 each → receive size / entry_price USDC
+        #                net profit = size / entry_price - size
+        #                           = size * (1 - entry_price) / entry_price
+        #   If you lose: you forfeit the entire stake → pnl = -size
+        #   ARB:         same win formula; deduct estimated round-trip fee (3%)
         self._conn.execute(
             """
             UPDATE trades_executed
@@ -236,9 +239,9 @@ class Database:
                                 ELSE                          'negative'
                               END,
                 pnl         = CASE
-                                WHEN trigger = 'arb'     THEN (1.0 - entry_price - 0.03) * size
-                                WHEN outcome = ?         THEN (1.0 - entry_price) * size
-                                ELSE                          -entry_price * size
+                                WHEN trigger = 'arb'     THEN (1.0 - entry_price - 0.03) / entry_price * size
+                                WHEN outcome = ?         THEN (1.0 - entry_price) / entry_price * size
+                                ELSE                          -size
                               END
             WHERE condition_id = ? AND resolved_at IS NULL
             """,

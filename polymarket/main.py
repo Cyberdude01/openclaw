@@ -45,6 +45,7 @@ Environment Variables
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sys
 from datetime import datetime, timezone
@@ -62,6 +63,7 @@ from .config import (
     DB_RETENTION_HOURS,
     DB_TRIM_INTERVAL,
     GAMMA_API,
+    POLY_API_KEY,
     SNAPSHOT_INTERVAL,
     SLUGS,
     SYMBOL_MAP,
@@ -345,6 +347,81 @@ async def _api_resolution_loop(db: Database) -> None:
             console.log(f"[yellow]API resolution loop error: {exc}[/yellow]")
 
 
+async def _redeem_loop() -> None:
+    """
+    Every 10 minutes, redeem all redeemable winning positions via the CLOB API.
+
+    Only active in live mode (POLY_API_KEY must be set).  In paper mode the
+    coroutine exits immediately so it does not take up an asyncio slot.
+
+    Polymarket endpoint:
+        POST https://clob.polymarket.com/redeem-positions
+        Body: {"conditionIds": ["0x…", …]}
+    Uses the same L2 HMAC-SHA256 auth headers as order submission.
+    """
+    if not POLY_API_KEY:
+        console.log("[dim]Redeem loop: paper mode — auto-redeem disabled[/dim]")
+        return
+
+    from .trader import _l2_headers  # reuse existing HMAC auth helper
+
+    REDEEM_INTERVAL = 600   # 10 minutes
+
+    while True:
+        await asyncio.sleep(REDEEM_INTERVAL)
+        try:
+            # Ask the CLOB for positions that are currently redeemable
+            async with aiohttp.ClientSession() as session:
+                headers_get = {
+                    "Content-Type": "application/json",
+                    **_l2_headers("GET", "/redeemable-positions"),
+                }
+                async with session.get(
+                    f"{CLOB_API}/redeemable-positions",
+                    headers=headers_get,
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as r:
+                    if r.status != 200:
+                        console.log(f"[yellow]Redeem: /redeemable-positions returned {r.status}[/yellow]")
+                        continue
+                    redeemable = await r.json()
+
+                # redeemable is a list of objects; extract conditionIds
+                if isinstance(redeemable, dict):
+                    redeemable = redeemable.get("data", []) or redeemable.get("positions", [])
+
+                condition_ids = list({
+                    item.get("conditionId") or item.get("condition_id")
+                    for item in (redeemable or [])
+                    if item.get("conditionId") or item.get("condition_id")
+                })
+
+                if not condition_ids:
+                    continue
+
+                console.log(f"[cyan]Redeem: {len(condition_ids)} condition_id(s) redeemable[/cyan]")
+
+                body_s  = json.dumps({"conditionIds": condition_ids})
+                headers_post = {
+                    "Content-Type": "application/json",
+                    **_l2_headers("POST", "/redeem-positions", body_s),
+                }
+                async with session.post(
+                    f"{CLOB_API}/redeem-positions",
+                    data=body_s,
+                    headers=headers_post,
+                    timeout=aiohttp.ClientTimeout(total=20),
+                ) as r:
+                    resp = await r.json()
+                    if r.status == 200:
+                        console.log(f"[green]Redeem successful: {resp}[/green]")
+                    else:
+                        console.log(f"[yellow]Redeem POST returned {r.status}: {resp}[/yellow]")
+
+        except Exception as exc:
+            console.log(f"[yellow]Redeem loop error: {exc}[/yellow]")
+
+
 async def _trim_loop(db: Database) -> None:
     """Trim old market_snapshots and decision_signals once per hour."""
     while True:
@@ -400,6 +477,7 @@ async def main(data_only: bool = False):
                 _snapshot_loop(state, db),
                 _resolution_loop(state, db),
                 _api_resolution_loop(db),
+                _redeem_loop(),
                 _trim_loop(db),
                 _auto_restart_loop(AUTO_RESTART_HOURS),
             )
@@ -452,6 +530,7 @@ async def main(data_only: bool = False):
             _snapshot_loop(state, db),
             _resolution_loop(state, db),
             _api_resolution_loop(db),
+            _redeem_loop(),
             _trim_loop(db),
             _auto_restart_loop(AUTO_RESTART_HOURS),
         )
