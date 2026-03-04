@@ -263,13 +263,17 @@ class Database:
         ).fetchall()
 
     def all_trades(self) -> List[sqlite3.Row]:
-        """All trades joined with resolution data (NULL if not yet resolved)."""
+        """All trades joined with resolution data and market window timestamps."""
         return self._conn.execute(
             """
             SELECT t.*,
-                   r.winning_outcome AS market_winner,
+                   r.winning_outcome  AS market_winner,
                    r.final_up_price,
-                   r.final_down_price
+                   r.final_down_price,
+                   (SELECT MIN(s.market_start_ts) FROM market_snapshots s
+                    WHERE s.condition_id = t.condition_id) AS window_start,
+                   (SELECT MIN(s.market_end_ts)   FROM market_snapshots s
+                    WHERE s.condition_id = t.condition_id) AS window_end
             FROM   trades_executed t
             LEFT JOIN market_resolutions r USING (condition_id)
             ORDER BY t.ts DESC
@@ -277,16 +281,17 @@ class Database:
         ).fetchall()
 
     def trade_summary(self) -> Dict[str, Any]:
-        """Aggregate P&L and win-rate across all resolved trades."""
+        """Aggregate counts and P&L across all trades (resolved and pending)."""
         row = self._conn.execute(
             """
-            SELECT COUNT(*)                                    AS total,
-                   SUM(CASE WHEN result='positive' THEN 1 END) AS wins,
-                   SUM(CASE WHEN result='negative' THEN 1 END) AS losses,
-                   SUM(CASE WHEN result='arb'      THEN 1 END) AS arb_trades,
-                   ROUND(SUM(COALESCE(pnl, 0)), 4)             AS total_pnl
+            SELECT COUNT(*)                                              AS total,
+                   SUM(CASE WHEN resolved_at IS NOT NULL  THEN 1 END)  AS resolved,
+                   SUM(CASE WHEN result = 'positive'      THEN 1 END)  AS wins,
+                   SUM(CASE WHEN result = 'negative'      THEN 1 END)  AS losses,
+                   SUM(CASE WHEN result = 'arb'           THEN 1 END)  AS arb_trades,
+                   SUM(CASE WHEN resolved_at IS NULL       THEN 1 END)  AS pending,
+                   ROUND(SUM(COALESCE(pnl, 0)), 4)                     AS total_pnl
             FROM   trades_executed
-            WHERE  resolved_at IS NOT NULL
             """
         ).fetchone()
         return dict(row) if row else {}

@@ -327,31 +327,35 @@ class DataExporter:
         rows    = self.db.all_trades()    if self.db else []
         summary = self.db.trade_summary() if self.db else {}
 
-        total  = int(summary.get("total",      0) or 0)
-        wins   = int(summary.get("wins",       0) or 0)
-        losses = int(summary.get("losses",     0) or 0)
-        arbs   = int(summary.get("arb_trades", 0) or 0)
-        pnl    = float(summary.get("total_pnl", 0.0) or 0.0)
-        pending = total - wins - losses - arbs
-        win_rate = f"{wins/total*100:.1f}%" if total > 0 else "—"
+        total    = int(summary.get("total",      0) or 0)
+        resolved = int(summary.get("resolved",   0) or 0)
+        wins     = int(summary.get("wins",       0) or 0)
+        losses   = int(summary.get("losses",     0) or 0)
+        arbs     = int(summary.get("arb_trades", 0) or 0)
+        pending  = int(summary.get("pending",    0) or 0)
+        pnl      = float(summary.get("total_pnl", 0.0) or 0.0)
+        # Win-rate is against resolved (non-arb) trades only
+        non_arb_resolved = wins + losses
+        win_rate = f"{wins/non_arb_resolved*100:.1f}%" if non_arb_resolved > 0 else "—"
         pnl_str  = f"{'+'if pnl>=0 else ''}${pnl:.4f}"
 
         lines = [
             "# Decision Tracker",
             f"\n> **Updated:** `{ts}` &nbsp;|&nbsp; Full trade history — refreshed every 5 minutes\n",
             "## Summary",
-            _row(["Total", "Wins", "Losses", "ARB", "Pending", "Win Rate", "Total P&L"]),
-            _row(["-"*5,   "-"*4,  "-"*6,    "-"*3, "-"*7,    "-"*8,      "-"*10]),
-            _row([str(total), str(wins), str(losses), str(arbs),
+            _row(["Total", "Resolved", "Wins", "Losses", "ARB", "Pending", "Win Rate", "Realised P&L"]),
+            _row(["-"*5,   "-"*8,      "-"*4,  "-"*6,    "-"*3, "-"*7,    "-"*8,      "-"*12]),
+            _row([str(total), str(resolved), str(wins), str(losses), str(arbs),
                   str(pending), win_rate, pnl_str]),
             "",
             "## Trade Log",
-            _row(["Entry Time (ET)", "Symbol", "Slug", "Outcome", "Trigger",
-                  "Entry Price", "Size (USDC)", "Mode",
+            "> Each row: Entry Time · Market Slug · Condition ID (first 12 chars) · 15-min Window\n",
+            _row(["Entry Time (ET)", "Market & Window",
+                  "Outcome", "Trigger", "Entry $", "Size", "Mode",
                   "Resolved (ET)", "Winner", "Result", "P&L", "Reasoning"]),
-            _row(["-"*15, "-"*6, "-"*17, "-"*7, "-"*20,
-                  "-"*11, "-"*11, "-"*5,
-                  "-"*14, "-"*6, "-"*8, "-"*9, "-"*50]),
+            _row(["-"*17, "-"*40,
+                  "-"*7, "-"*22, "-"*7, "-"*6, "-"*5,
+                  "-"*17, "-"*6, "-"*8, "-"*9, "-"*50]),
         ]
 
         _RESULT_ICON = {
@@ -361,11 +365,28 @@ class DataExporter:
         }
 
         for r in rows:
-            slug     = _SLUG_FOR.get(r["symbol"], r["symbol"])
+            slug      = _SLUG_FOR.get(r["symbol"], r["symbol"])
+            cond_id   = (r["condition_id"] or "")
+            cond_short = cond_id[:12] + "…" if len(cond_id) > 12 else cond_id
+
+            # Market window — from snapshot JOIN (may be None before first snapshot)
+            win_start = _to_et(r["window_start"]) if r["window_start"] else "—"
+            win_end   = _to_et(r["window_end"])   if r["window_end"]   else "—"
+            # Compact: "09:00 AM → 09:15 AM ET" (strip date + timezone from second)
+            def _compact_window(s: str, e: str) -> str:
+                if s == "—":
+                    return "—"
+                # strip "ET" from start, keep only time+am/pm for end
+                s_t = s.split(" ")[1] + " " + s.split(" ")[2] if len(s.split(" ")) >= 3 else s
+                e_t = e.split(" ")[1] + " " + e.split(" ")[2] if len(e.split(" ")) >= 3 else e
+                return f"{s_t} → {e_t}"
+
+            market_cell = f"**{slug}** `{cond_short}`<br>{_compact_window(win_start, win_end)}"
+
             res_time = _to_et(r["resolved_at"]) if r["resolved_at"] else "⏳ Pending"
-            winner   = r["resolution"] or "—"
-            result   = r["result"]     or "⏳ Pending"
-            result_s = _RESULT_ICON.get(result, result)
+            winner   = r["market_winner"] or "—"
+            result   = r["result"]        or "pending"
+            result_s = _RESULT_ICON.get(result, "⏳ Pending")
             pnl_v    = r["pnl"]
             pnl_cell = f"{'+'if (pnl_v or 0)>=0 else ''}${(pnl_v or 0):.4f}" \
                        if pnl_v is not None else "⏳"
@@ -373,8 +394,7 @@ class DataExporter:
 
             lines.append(_row([
                 f"`{_to_et(r['ts'])}`",
-                r["symbol"],
-                slug,
+                market_cell,
                 f"**{r['outcome']}**",
                 f"`{r['trigger'] or '—'}`",
                 _price(r["entry_price"]),
@@ -388,7 +408,10 @@ class DataExporter:
             ]))
 
         if not rows:
-            lines.append(_row(["—"] * 13))
+            lines.append(
+                "> ℹ️ No trades recorded yet. Trades are generated at the 60%, 80%, "
+                "and 90% elapsed marks of each 15-minute market window."
+            )
 
         lines += ["", "---",
                   "_Auto-generated by [openclaw](https://github.com/Cyberdude01/openclaw)_"]

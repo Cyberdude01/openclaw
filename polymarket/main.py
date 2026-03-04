@@ -142,48 +142,67 @@ async def _snapshot_loop(state: MarketState, db: Database) -> None:
 
 async def _resolution_loop(state: MarketState, db: Database) -> None:
     """
-    Check for expired markets every 60 seconds and record their outcome.
+    Check for expired markets every 30 seconds and record their outcome.
 
-    Resolution heuristic: once a market's end_time has passed, if the UP token
-    price is ≥ 0.80 we call it UP; if ≤ 0.20 we call it DOWN.  Ambiguous
-    markets (0.20 < price < 0.80) are skipped until prices settle.
+    Resolution tiers (applied in order):
+      1. Clear settlement  — UP ≥ 0.85 or UP ≤ 0.15  (price firmly resolved)
+      2. Strong signal     — UP ≥ 0.70 or UP ≤ 0.30  (only after 2 min expiry)
+      3. Force resolve     — take whichever side is higher after 5 min
+         (guards against stale order books that never fully settle)
+    All tiers are skipped while the market is still active.
     """
     seen: set[str] = set()
     while True:
-        await asyncio.sleep(60)
+        await asyncio.sleep(30)
         try:
             now = datetime.now(timezone.utc)
             for slug in SLUGS:
                 symbol = SYMBOL_MAP.get(slug, slug)
-                for mkt in state.markets.get(slug, []):
+                for mkt in list(state.markets.get(slug, [])):
                     if mkt.end_time > now:
                         continue  # still active
                     if mkt.condition_id in seen:
                         continue  # already recorded
 
-                    up_price = mkt.up_token.price if mkt.up_token else None
+                    up_price = mkt.up_token.price  if mkt.up_token  else None
                     dn_price = mkt.down_token.price if mkt.down_token else None
                     if up_price is None:
                         continue
 
-                    if up_price >= 0.80:
-                        winner = "UP"
-                    elif up_price <= 0.20:
-                        winner = "DOWN"
-                    else:
-                        continue  # price not settled yet
+                    expired_secs = (now - mkt.end_time).total_seconds()
+                    winner: Optional[str] = None
 
+                    if up_price >= 0.85:
+                        winner = "UP"
+                    elif up_price <= 0.15:
+                        winner = "DOWN"
+                    elif expired_secs >= 120 and up_price >= 0.70:
+                        winner = "UP"
+                    elif expired_secs >= 120 and up_price <= 0.30:
+                        winner = "DOWN"
+                    elif expired_secs >= 300:
+                        # Force-resolve: whichever token has the higher price wins
+                        winner = "UP" if up_price >= 0.50 else "DOWN"
+
+                    if winner is None:
+                        continue
+
+                    final_dn = dn_price if (dn_price and abs(dn_price - up_price) > 0.01) \
+                               else round(1.0 - up_price, 4)
                     db.record_resolution(
-                        condition_id    = mkt.condition_id,
-                        symbol          = symbol,
-                        winning_outcome = winner,
-                        final_up_price  = up_price,
-                        final_down_price= dn_price or (1.0 - up_price),
+                        condition_id     = mkt.condition_id,
+                        symbol           = symbol,
+                        winning_outcome  = winner,
+                        final_up_price   = up_price,
+                        final_down_price = final_dn,
                     )
                     seen.add(mkt.condition_id)
+                    tier = ("clear" if up_price >= 0.85 or up_price <= 0.15 else
+                            "strong" if expired_secs < 300 else "forced")
                     console.log(
-                        f"[cyan]Resolution recorded: {symbol} {mkt.condition_id[:8]}… "
-                        f"→ {winner} (UP={up_price:.3f})[/cyan]"
+                        f"[cyan]Resolution [{tier}]: {symbol} [{slug}] "
+                        f"{mkt.condition_id[:12]}… → {winner} "
+                        f"(UP={up_price:.3f}, expired {expired_secs:.0f}s ago)[/cyan]"
                     )
         except Exception as exc:
             console.log(f"[yellow]Resolution loop error: {exc}[/yellow]")
