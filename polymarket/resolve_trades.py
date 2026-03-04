@@ -2,9 +2,15 @@
 """
 Standalone trade resolution script — run directly on the server.
 
-Looks up every unresolved trade in the SQLite database, fetches the final
-settlement price from the Polymarket DATA API (with a Gamma API fallback for
-condition_ids that have no snapshot rows), then writes the result and P&L.
+Looks up every unresolved trade in the SQLite database and resolves it using
+the Polymarket Gamma API (outcomePrices field) for settled markets, falling
+back to the CLOB API last-trade-price for markets not yet marked resolved.
+
+Strategy (no auth required — all public endpoints):
+  1. GET gamma-api.polymarket.com/markets?condition_id=<cid>
+     → if resolved=true, outcomePrices["1"/"0"] tells us the winner directly
+  2. If not yet settled, GET clob.polymarket.com/last-trade-price?token_id=<up>
+     → UP >= 0.90 wins UP; <= 0.10 wins DOWN; older than 30 min → higher side
 
 Usage (on server):
     python3 /root/polymarket/resolve_trades.py
@@ -16,23 +22,21 @@ The script is idempotent — safe to run multiple times.
 """
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import sys
-import urllib.request
 import urllib.parse
-import json
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
 # ── Config ────────────────────────────────────────────────────────────────────
 GAMMA_API = "https://gamma-api.polymarket.com"
-DATA_API  = "https://data-api.polymarket.com"
+CLOB_API  = "https://clob.polymarket.com"
 
-DB_PATH   = Path(os.getenv("DB_PATH", Path.home() / "polymarket.db")).expanduser()
-
-# Age threshold: only resolve markets older than this many seconds
-MIN_AGE_SECONDS = 1200   # 20 minutes
+DB_PATH         = Path(os.getenv("DB_PATH", Path.home() / "polymarket.db")).expanduser()
+MIN_AGE_SECONDS = 1200   # skip markets less than 20 min old
 
 
 def _get(url: str, timeout: int = 12) -> dict | list:
@@ -41,32 +45,76 @@ def _get(url: str, timeout: int = 12) -> dict | list:
         return json.loads(r.read().decode())
 
 
-def _find_up_token_from_gamma(cid: str) -> str | None:
-    """Query Gamma API for the UP outcome token_id of a condition."""
+def _resolve_from_gamma(cid: str) -> tuple[str | None, float | None, str | None]:
+    """
+    Query the Gamma API for a market by condition_id.
+
+    Returns (winner, up_price, token_id_up) where winner is "UP" or "DOWN",
+    or (None, None, token_id_up) if the market is not yet settled.
+    token_id_up may still be returned even when the market is unresolved.
+    """
     url = f"{GAMMA_API}/markets?condition_id={urllib.parse.quote(cid)}"
     try:
         data = _get(url)
     except Exception as exc:
-        print(f"  [warn] Gamma API error for {cid[:12]}…: {exc}")
-        return None
+        print(f"  [warn] Gamma API error: {exc}")
+        return None, None, None
 
     mkts = data if isinstance(data, list) else data.get("markets", [])
-    for mkt in mkts:
-        for tok in mkt.get("tokens", []):
-            if tok.get("outcome", "").strip().upper() in ("UP",):
-                return tok.get("token_id") or tok.get("tokenId")
-    return None
+    if not mkts:
+        print(f"  [warn] Gamma API: no market found for condition_id {cid[:16]}…")
+        return None, None, None
+
+    mkt = mkts[0]
+
+    # Extract token info (for CLOB fallback)
+    token_id_up = None
+    up_idx      = None
+    tokens = mkt.get("tokens", [])
+    for i, tok in enumerate(tokens):
+        if tok.get("outcome", "").strip().upper() == "UP":
+            token_id_up = tok.get("token_id") or tok.get("tokenId")
+            up_idx = i
+            break
+
+    # Check if the market is already resolved
+    if mkt.get("resolved") or mkt.get("resolutionTime"):
+        outcome_prices = mkt.get("outcomePrices", [])
+        # outcomePrices[i] corresponds to tokens[i]: "1" = winner, "0" = loser
+        if up_idx is not None and up_idx < len(outcome_prices):
+            try:
+                up_price = float(outcome_prices[up_idx])
+            except (ValueError, TypeError):
+                up_price = None
+        else:
+            # Fallback: scan for the token with price "1"
+            up_price = None
+            for i, tok in enumerate(tokens):
+                if tok.get("outcome", "").strip().upper() == "UP":
+                    try:
+                        up_price = float(outcome_prices[i])
+                    except Exception:
+                        pass
+                    break
+
+        if up_price is not None:
+            winner = "UP" if up_price >= 0.5 else "DOWN"
+            print(f"  Gamma API (resolved): UP={up_price:.4f} → winner={winner}")
+            return winner, up_price, token_id_up
+
+    # Market found but not settled yet; return token_id for CLOB fallback
+    return None, None, token_id_up
 
 
-def _last_trade_price(token_id: str) -> float | None:
-    """Fetch the last traded price for a token from the DATA API."""
-    url = f"{DATA_API}/last-trade-price?token_id={urllib.parse.quote(token_id)}"
+def _clob_last_price(token_id_up: str) -> float | None:
+    """Fetch last traded price for the UP token from the public CLOB API."""
+    url = f"{CLOB_API}/last-trade-price?token_id={urllib.parse.quote(token_id_up)}"
     try:
         data = _get(url)
         price = data.get("price")
         return float(price) if price is not None else None
     except Exception as exc:
-        print(f"  [warn] DATA API error ({token_id[:12]}…): {exc}")
+        print(f"  [warn] CLOB API error: {exc}")
         return None
 
 
@@ -78,19 +126,19 @@ def _record_resolution(conn: sqlite3.Connection, cid: str, symbol: str,
     P&L formula (Polymarket binary markets):
       Win:  profit = (1.0 - entry_price) * size
       Loss: loss   = -entry_price * size
-      ARB:  profit = (1.0 - entry_price - 0.03) * size  (round-trip fee deducted)
+      ARB:  profit = (1.0 - entry_price - 0.03) * size
     """
-    now = datetime.now(timezone.utc).isoformat()
-    cur = conn.execute(
+    now  = datetime.now(timezone.utc).isoformat()
+    rows = conn.execute(
         "SELECT id, outcome, entry_price, size, trigger FROM trades_executed "
         "WHERE condition_id = ? AND resolved_at IS NULL",
         (cid,),
-    )
-    rows = cur.fetchall()
+    ).fetchall()
+
     count = 0
     for row in rows:
         trade_id    = row[0]
-        outcome     = row[1]          # "UP" or "DOWN"
+        outcome     = row[1]
         entry_price = float(row[2])
         size        = float(row[3])
         trigger     = row[4] or ""
@@ -116,7 +164,7 @@ def _record_resolution(conn: sqlite3.Connection, cid: str, symbol: str,
         )
         pnl_str = f"+${pnl:.4f}" if pnl >= 0 else f"-${abs(pnl):.4f}"
         icon = "✅" if result == "positive" else ("💰" if result == "arb" else "❌")
-        print(f"  {icon}  trade #{trade_id}: {outcome} @ {entry_price:.4f} × ${size:.2f} "
+        print(f"  {icon} trade #{trade_id}: {outcome} @ {entry_price:.4f} × ${size:.2f} "
               f"→ {result.upper()} {pnl_str}")
         count += 1
 
@@ -132,7 +180,6 @@ def main() -> None:
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
 
-    # ── Find unresolved trades ─────────────────────────────────────────────────
     rows = conn.execute(
         """
         SELECT DISTINCT
@@ -156,15 +203,13 @@ def main() -> None:
 
     now = datetime.now(timezone.utc)
     print(f"Found {len(rows)} unresolved condition_id(s).\n")
-
     total_resolved = 0
 
     for row in rows:
-        cid         = row["condition_id"]
-        symbol      = row["symbol"] or "?"
-        token_id_up = row["token_id_up"]
+        cid             = row["condition_id"]
+        symbol          = row["symbol"] or "?"
+        snap_token_up   = row["token_id_up"]   # from market_snapshots (may be None)
 
-        # Compute age
         try:
             age = (now - datetime.fromisoformat(
                 row["first_trade_ts"].replace("Z", "+00:00")
@@ -175,48 +220,46 @@ def main() -> None:
         print(f"┌─ {symbol}  {cid[:16]}…  (age: {age/60:.1f} min)")
 
         if age < MIN_AGE_SECONDS:
-            print(f"└─ skipping — market is only {age/60:.1f} min old (< 20 min)\n")
+            print(f"└─ skip — market is only {age/60:.1f} min old\n")
             continue
 
-        # ── Get UP token id ────────────────────────────────────────────────────
-        if token_id_up:
-            print(f"│  token_id_up from DB snapshot: {token_id_up[:20]}…")
-        else:
-            print(f"│  No snapshot row — querying Gamma API…")
-            token_id_up = _find_up_token_from_gamma(cid)
+        # ── Step 1: Gamma API (primary — works for settled markets) ──────────
+        winner, up_price, gamma_token_up = _resolve_from_gamma(cid)
+
+        # Prefer snapshot token_id_up; use Gamma's if we didn't have one
+        token_id_up = snap_token_up or gamma_token_up
+
+        # ── Step 2: CLOB fallback for unresolved/active markets ──────────────
+        if winner is None:
             if not token_id_up:
-                print(f"└─ SKIP: could not find UP token for {cid[:12]}…\n")
+                print(f"└─ SKIP: no UP token found for {cid[:12]}…\n")
                 continue
-            print(f"│  token_id_up from Gamma API: {token_id_up[:20]}…")
 
-        # ── Get last traded price ──────────────────────────────────────────────
-        up_price = _last_trade_price(token_id_up)
-        if up_price is None:
-            print(f"└─ SKIP: DATA API returned no price\n")
-            continue
+            up_price = _clob_last_price(token_id_up)
+            if up_price is None:
+                print(f"└─ SKIP: CLOB API returned no price\n")
+                continue
 
-        print(f"│  last trade price: UP={up_price:.4f}  DOWN≈{1-up_price:.4f}")
+            print(f"  CLOB last-trade-price: UP={up_price:.4f}")
 
-        # ── Determine winner ──────────────────────────────────────────────────
-        if up_price >= 0.90:
-            winner = "UP"
-            reason = "UP ≥ 0.90 (clear settlement)"
-        elif up_price <= 0.10:
-            winner = "DOWN"
-            reason = "UP ≤ 0.10 (clear settlement)"
-        else:
-            # Force-resolve for old trades — take the higher side
-            winner = "UP" if up_price >= 0.50 else "DOWN"
-            reason = f"age={age/60:.0f}min, force-resolve ({up_price:.4f} → {winner})"
+            if up_price >= 0.90:
+                winner = "UP"
+            elif up_price <= 0.10:
+                winner = "DOWN"
+            elif age >= 1800:
+                winner = "UP" if up_price >= 0.50 else "DOWN"
+                print(f"  Force-resolve (age={age/60:.0f}min): → {winner}")
+            else:
+                print(f"└─ skip — price still ambiguous ({up_price:.4f}), will retry\n")
+                continue
 
-        print(f"│  winner: {winner}  ({reason})")
+        print(f"│  winner: {winner}")
 
-        # ── Write to DB ────────────────────────────────────────────────────────
         n = _record_resolution(conn, cid, symbol, winner, up_price)
         print(f"└─ resolved {n} trade(s)\n")
         total_resolved += n
 
-    print(f"\nDone. Resolved {total_resolved} trade(s) total.")
+    print(f"Done. Resolved {total_resolved} trade(s) total.")
     conn.close()
 
 

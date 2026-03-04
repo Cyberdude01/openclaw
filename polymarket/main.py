@@ -56,6 +56,7 @@ from rich.console import Console
 from .collector import CollectorAgent, MarketState, run_display
 from .config import (
     AUTO_RESTART_HOURS,
+    CLOB_API,
     DATA_API,
     DB_PATH,
     DB_RETENTION_HOURS,
@@ -224,22 +225,16 @@ async def _resolution_loop(state: MarketState, db: Database) -> None:
 
 async def _api_resolution_loop(db: Database) -> None:
     """
-    Every 2 minutes, fetch the final settlement price from the Polymarket
-    DATA API for any trades that remain unresolved in SQLite.
+    Every 2 minutes, resolve any trades still pending in SQLite.
 
-    This handles markets that expired after a restart (in-process price state
-    was lost) or whose prices never crossed the state-based thresholds.
-
-    Strategy
-    --------
-    1. Query trades_executed for condition_ids with resolved_at IS NULL
-       that are at least 20 minutes old (market must have expired).
-    2. Look up token_id_up from market_snapshots (fast path).
-       If missing (trades made before snapshot loop was deployed), fall back
-       to the Gamma API: GET /markets?condition_id=<cid> to find the UP token.
-    3. Call DATA_API /last-trade-price?token_id=<up_token>.
-    4. Price >= 0.90 → UP wins; <= 0.10 → DOWN wins.
-       If older than 30 min and price between 0.10–0.90: take the higher side.
+    Strategy (all public endpoints, no auth needed):
+    1. Query unresolved trades older than 20 min.
+    2. GET gamma-api.polymarket.com/markets?condition_id=<cid>
+       - If resolved=true, outcomePrices directly gives the winner.
+       - Also extracts token_id_up for the CLOB fallback.
+    3. Fallback: GET clob.polymarket.com/last-trade-price?token_id=<up>
+       - UP >= 0.90 → UP wins; <= 0.10 → DOWN wins.
+       - After 30 min: force-resolve to whichever side is higher.
     """
     while True:
         await asyncio.sleep(120)
@@ -264,11 +259,10 @@ async def _api_resolution_loop(db: Database) -> None:
 
             async with aiohttp.ClientSession() as session:
                 for row in rows:
-                    cid         = row["condition_id"]
-                    symbol      = row["symbol"] or "?"
-                    token_id_up = row["token_id_up"]
+                    cid           = row["condition_id"]
+                    symbol        = row["symbol"] or "?"
+                    snap_token_up = row["token_id_up"]
 
-                    # Skip if trade is < 20 min old (market may still be live)
                     try:
                         age = (
                             datetime.now(timezone.utc) -
@@ -282,69 +276,71 @@ async def _api_resolution_loop(db: Database) -> None:
                     if age < 1200:
                         continue
 
-                    # ── Fallback: look up UP token from Gamma API ─────────────
-                    # This fires for trades made before the snapshot loop was
-                    # deployed (no market_snapshots rows for that condition_id).
-                    if not token_id_up:
-                        try:
-                            url = f"{GAMMA_API}/markets?condition_id={cid}"
-                            async with session.get(
-                                url, timeout=aiohttp.ClientTimeout(total=10)
-                            ) as r:
-                                data = await r.json()
-                            mkts = data if isinstance(data, list) else data.get("markets", [])
-                            for mkt in mkts:
-                                for tok in mkt.get("tokens", []):
-                                    if tok.get("outcome", "").upper() in ("UP",):
-                                        token_id_up = tok.get("token_id") or tok.get("tokenId")
-                                        break
-                                if token_id_up:
-                                    break
-                        except Exception as exc:
-                            console.log(f"[yellow]Gamma lookup ({cid[:8]}): {exc}[/yellow]")
+                    winner      = None
+                    up_price    = None
+                    token_id_up = snap_token_up
 
-                    if not token_id_up:
-                        console.log(
-                            f"[dim]API resolution: no UP token for {cid[:12]}… (will retry)[/dim]"
-                        )
-                        continue
-
+                    # ── Step 1: Gamma API — outcomePrices for settled markets ─
                     try:
-                        url = f"{DATA_API}/last-trade-price?token_id={token_id_up}"
+                        url = f"{GAMMA_API}/markets?condition_id={cid}"
                         async with session.get(
                             url, timeout=aiohttp.ClientTimeout(total=10)
                         ) as r:
-                            data     = await r.json()
-                            up_price = float(data.get("price", 0))
-
-                        if up_price <= 0:
-                            continue
-
-                        if up_price >= 0.90:
-                            winner = "UP"
-                        elif up_price <= 0.10:
-                            winner = "DOWN"
-                        elif age >= 1800:
-                            # Force-resolve after 30 min: take whichever side is higher
-                            winner = "UP" if up_price >= 0.50 else "DOWN"
-                        else:
-                            continue   # price still ambiguous, wait
-
-                        db.record_resolution(
-                            condition_id     = cid,
-                            symbol           = symbol,
-                            winning_outcome  = winner,
-                            final_up_price   = up_price,
-                            final_down_price = round(1.0 - up_price, 4),
-                        )
-                        console.log(
-                            f"[green]API resolution: {symbol} {cid[:12]}… "
-                            f"→ {winner} (UP={up_price:.4f}, age={age:.0f}s)[/green]"
-                        )
+                            data = await r.json()
+                        mkts = data if isinstance(data, list) else data.get("markets", [])
+                        if mkts:
+                            mkt    = mkts[0]
+                            tokens = mkt.get("tokens", [])
+                            # Always grab token_id_up if we don't have it
+                            if not token_id_up:
+                                for tok in tokens:
+                                    if tok.get("outcome", "").upper() == "UP":
+                                        token_id_up = tok.get("token_id") or tok.get("tokenId")
+                                        break
+                            # Check for settlement
+                            if mkt.get("resolved") or mkt.get("resolutionTime"):
+                                outcome_prices = mkt.get("outcomePrices", [])
+                                for i, tok in enumerate(tokens):
+                                    if tok.get("outcome", "").upper() == "UP" and i < len(outcome_prices):
+                                        up_price = float(outcome_prices[i])
+                                        winner   = "UP" if up_price >= 0.5 else "DOWN"
+                                        break
                     except Exception as exc:
-                        console.log(
-                            f"[yellow]API resolution fetch ({cid[:8]}): {exc}[/yellow]"
-                        )
+                        console.log(f"[yellow]Gamma API ({cid[:8]}…): {exc}[/yellow]")
+
+                    # ── Step 2: CLOB last-trade-price fallback ────────────────
+                    if winner is None and token_id_up:
+                        try:
+                            url = f"{CLOB_API}/last-trade-price?token_id={token_id_up}"
+                            async with session.get(
+                                url, timeout=aiohttp.ClientTimeout(total=10)
+                            ) as r:
+                                data     = await r.json()
+                                up_price = float(data.get("price", 0))
+
+                            if up_price >= 0.90:
+                                winner = "UP"
+                            elif up_price <= 0.10:
+                                winner = "DOWN"
+                            elif age >= 1800:
+                                winner = "UP" if up_price >= 0.50 else "DOWN"
+                        except Exception as exc:
+                            console.log(f"[yellow]CLOB price ({cid[:8]}…): {exc}[/yellow]")
+
+                    if winner is None:
+                        continue
+
+                    db.record_resolution(
+                        condition_id     = cid,
+                        symbol           = symbol,
+                        winning_outcome  = winner,
+                        final_up_price   = up_price if up_price else 0.0,
+                        final_down_price = round(1.0 - (up_price or 0.0), 4),
+                    )
+                    console.log(
+                        f"[green]API resolution: {symbol} {cid[:12]}… "
+                        f"→ {winner} (UP={up_price:.4f}, age={age:.0f}s)[/green]"
+                    )
         except Exception as exc:
             console.log(f"[yellow]API resolution loop error: {exc}[/yellow]")
 
