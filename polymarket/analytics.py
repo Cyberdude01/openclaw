@@ -275,9 +275,9 @@ class MarketAnalytics:
             prob_008     = prob_tbl.get(0.08, 0.0),
             prob_012     = prob_tbl.get(0.12, 0.0),
             prob_020     = prob_tbl.get(0.20, 0.0),
-            dir_60pct    = self.direction_probability(up_price, bucket, max(pct, 0.60)),
-            dir_80pct    = self.direction_probability(up_price, bucket, max(pct, 0.80)),
-            dir_90pct    = self.direction_probability(up_price, bucket, max(pct, 0.90)),
+            dir_60pct    = self.direction_probability(up_price, bucket, 0.60),
+            dir_80pct    = self.direction_probability(up_price, bucket, 0.80),
+            dir_90pct    = self.direction_probability(up_price, bucket, 0.90),
         )
         self._last_snapshot = snap
         return snap

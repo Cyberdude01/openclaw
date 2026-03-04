@@ -9,6 +9,8 @@ Three distinct reports are generated under reports/:
   decision_summary.md — Analysis leading to every signal emitted
   decision_tracker.md — Every trade taken, with resolution and P&L
 
+All timestamps displayed in Eastern Time (America/New_York).
+
 Environment variables
 ---------------------
 GITHUB_TOKEN     Personal access token with repo write scope (required)
@@ -23,7 +25,7 @@ import json
 import os
 import subprocess
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional
 
@@ -39,11 +41,44 @@ GITHUB_TOKEN    = os.getenv("GITHUB_TOKEN",    "")
 EXPORT_DIR      = Path(os.getenv("EXPORT_DIR", str(Path.home() / "bob")))
 EXPORT_INTERVAL = int(os.getenv("EXPORT_INTERVAL", "300"))
 
+# Reverse SYMBOL_MAP: "BTC" → "btc-updown-15m"
+_SLUG_FOR = {v: k for k, v in SYMBOL_MAP.items()}
 
-# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+# ─── Eastern Time helpers ─────────────────────────────────────────────────────
+
+try:
+    from zoneinfo import ZoneInfo as _ZI
+    _ET = _ZI("America/New_York")
+    def _to_et(ts: str) -> str:
+        """Convert a UTC ISO timestamp string to an ET-formatted string."""
+        try:
+            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            return dt.astimezone(_ET).strftime("%Y-%m-%d %I:%M %p ET")
+        except Exception:
+            return ts
+    def _now_et() -> str:
+        return datetime.now(_ET).strftime("%Y-%m-%d %I:%M:%S %p ET")
+    def _now_et_iso() -> str:
+        return datetime.now(_ET).strftime("%Y-%m-%dT%H:%M:%S ET")
+except Exception:
+    # Python < 3.9 / missing tzdata: fall back to fixed UTC-5 (EST)
+    _EST = timezone(timedelta(hours=-5))
+    def _to_et(ts: str) -> str:
+        try:
+            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            return dt.astimezone(_EST).strftime("%Y-%m-%d %I:%M %p EST")
+        except Exception:
+            return ts
+    def _now_et() -> str:
+        return datetime.now(_EST).strftime("%Y-%m-%d %I:%M:%S %p EST")
+    def _now_et_iso() -> str:
+        return datetime.now(_EST).strftime("%Y-%m-%dT%H:%M:%S EST")
+
+
+# ─── Git helpers ──────────────────────────────────────────────────────────────
 
 def _auth_url() -> str:
-    """Inject GITHUB_TOKEN into the HTTPS remote URL."""
     if GITHUB_TOKEN and EXPORT_REPO.startswith("https://"):
         return EXPORT_REPO.replace("https://", f"https://{GITHUB_TOKEN}@", 1)
     return EXPORT_REPO
@@ -59,15 +94,41 @@ def _git(args: List[str], **kw) -> bool:
         return False
 
 
+# ─── Cell formatters (used in all three reports) ──────────────────────────────
+
+def _f(val, fmt: str, suffix: str = "") -> str:
+    """Format val with fmt if not None/falsy, else return '—'."""
+    if val is None:
+        return "—"
+    try:
+        return format(val, fmt) + suffix
+    except Exception:
+        return str(val)
+
+
+def _pct(val) -> str:
+    return f"{val*100:.1f}%" if val is not None else "—"
+
+
+def _price(val) -> str:
+    return f"{val:.4f}" if val is not None else "—"
+
+
+def _row(cells: List[str]) -> str:
+    return "| " + " | ".join(cells) + " |"
+
+
 # ─── Exporter ─────────────────────────────────────────────────────────────────
 
 class DataExporter:
     """
     Snapshots MarketState + trading data to JSON files inside EXPORT_DIR
-    and pushes them to the configured GitHub repository.
+    and pushes them to the configured GitHub repository every EXPORT_INTERVAL s.
 
-    Three Markdown reports are also generated under reports/ and pushed
-    alongside the raw JSON data.
+    Three Markdown reports are generated under reports/:
+      data_collector.md   — all raw + calculated snapshot data
+      decision_summary.md — every signal with full reasoning
+      decision_tracker.md — every trade with entry, resolution, and P&L
     """
 
     def __init__(
@@ -116,7 +177,7 @@ class DataExporter:
         console.log("[green]Exporter: repo ready[/green]")
         return True
 
-    # ── Market snapshot data ───────────────────────────────────────────────────
+    # ── Market snapshot (for JSON + README) ───────────────────────────────────
 
     def _market_snapshot(self) -> Dict[str, Any]:
         out: Dict[str, Any] = {}
@@ -124,24 +185,34 @@ class DataExporter:
             sym  = SYMBOL_MAP.get(slug, slug)
             mkt  = self.state.get_current_market(slug)
             snap = self.state.analytics.get(sym).last_snapshot
-            row: Dict[str, Any] = {"symbol": sym}
+            row: Dict[str, Any] = {"symbol": sym, "slug": slug}
+
             if mkt:
+                # Use analytics snap prices (computed directly from order books)
+                # and fall back to mkt token prices only when snap is unavailable.
+                up_p  = (snap.up_price   if snap else None) or (mkt.up_token.price   if mkt.up_token   else None)
+                dn_p  = (snap.down_price if snap else None) or (mkt.down_token.price if mkt.down_token else None)
+
+                # If DOWN price equals UP (stale order book at expiry), derive it
+                # from UP: in a binary market UP + DOWN ≈ 1.0
+                if up_p is not None and dn_p is not None and abs(up_p - dn_p) < 0.005:
+                    dn_p = round(1.0 - up_p, 4)
+
                 row.update({
                     "condition_id":  mkt.condition_id,
                     "elapsed_pct":   round(mkt.elapsed_pct, 4),
                     "remaining_sec": round(mkt.remaining_seconds, 1),
-                    "up_price":      mkt.up_token.price   if mkt.up_token   else None,
-                    "down_price":    mkt.down_token.price if mkt.down_token else None,
+                    "up_price":      round(up_p, 4) if up_p is not None else None,
+                    "down_price":    round(dn_p, 4) if dn_p is not None else None,
                     "arb":           mkt.arb_opportunity,
                 })
+
             if snap:
                 row.update({
                     "rv60":         round(snap.rv60,   6),
                     "eff60":        round(snap.eff60,  4),
                     "vol_bucket":   snap.vol_bucket.value,
                     "trend_bucket": snap.trend_bucket.value,
-                    "up_price_ob":  round(snap.up_price,   4),
-                    "down_price_ob":round(snap.down_price, 4),
                     "spread":       round(snap.spread,     4),
                     "dir_60pct":    round(snap.dir_60pct,  4),
                     "dir_80pct":    round(snap.dir_80pct,  4),
@@ -156,50 +227,53 @@ class DataExporter:
     # ── Report 1: Data Collector ───────────────────────────────────────────────
 
     def _build_data_collector_report(self, ts: str) -> str:
+        rows = self.db.recent_snapshots(hours=48, limit=500) if self.db else []
+
         lines = [
             "# Data Collector Report",
-            f"\n> **Updated:** `{ts}` &nbsp;|&nbsp; Last 500 market snapshots from SQLite\n",
-            "| Time (UTC) | Symbol | UP Price | DOWN Price | Spread | Elapsed% | "
-            "Vol Bucket | Trend | RV60 | Eff60 | P(UP)@60% | UP Trades | DN Trades | ARB |",
-            "|------------|--------|----------|------------|--------|----------|"
-            "-----------|-------|------|-------|-----------|-----------|-----------|-----|",
+            f"\n> **Updated:** `{ts}` &nbsp;|&nbsp; Last 500 market snapshots (48 h)\n",
+            _row(["Time (ET)", "Symbol", "Slug", "UP Price", "DOWN Price",
+                  "UP Spread", "DN Spread", "Elapsed%", "Vol Bucket", "Trend",
+                  "RV60", "Eff60", "P(UP)@60%", "UP Trades", "DN Trades", "ARB"]),
+            _row(["-"*15, "-"*6, "-"*17, "-"*8, "-"*8,
+                  "-"*8, "-"*8, "-"*8, "-"*9, "-"*5,
+                  "-"*7, "-"*5, "-"*9, "-"*9, "-"*9, "-"*6]),
         ]
 
-        rows = self.db.recent_snapshots(hours=48, limit=500) if self.db else []
         for r in rows:
-            arb = f"{r['arb_profit']:.4f}" if r["arb_profit"] else "—"
-            lines.append(
-                f"| `{str(r['ts'])[:19]}` | {r['symbol']} "
-                f"| {r['up_price']:.4f}   " if r["up_price"]   else "| —         "
-                f"| {r['down_price']:.4f} " if r["down_price"] else "| —         "
-                f"| {r['up_spread']:.4f}  " if r["up_spread"]  else "| —         "
-                f"| {r['elapsed_pct']*100:.0f}% "
-                f"| {r['vol_bucket'] or '—'} "
-                f"| {r['trend_bucket'] or '—'} "
-                f"| {r['rv60']:.5f}    "  if r["rv60"]   else "| —         "
-                f"| {r['eff60']:.3f}   "  if r["eff60"]  else "| —      "
-                f"| {r['dir_60pct']*100:.1f}% " if r["dir_60pct"] else "| —         "
-                f"| {r['up_trade_count'] or 0} "
-                f"| {r['down_trade_count'] or 0} "
-                f"| {arb} |"
-            )
+            slug = _SLUG_FOR.get(r["symbol"], r["symbol"])
+            cells = [
+                f"`{_to_et(r['ts'])}`",
+                r["symbol"] or "—",
+                slug,
+                _price(r["up_price"]),
+                _price(r["down_price"]),
+                _price(r["up_spread"]),
+                _price(r["down_spread"]),
+                _pct(r["elapsed_pct"]),
+                r["vol_bucket"]   or "—",
+                r["trend_bucket"] or "—",
+                _f(r["rv60"],  ".5f"),
+                _f(r["eff60"], ".3f"),
+                _pct(r["dir_60pct"]),
+                str(r["up_trade_count"]   or 0),
+                str(r["down_trade_count"] or 0),
+                _f(r["arb_profit"], ".4f") if r["arb_profit"] else "—",
+            ]
+            lines.append(_row(cells))
 
         if not rows:
-            lines.append("| — | No data yet | — | — | — | — | — | — | — | — | — | — | — | — |")
+            lines.append(_row(["—"] * 16))
 
-        lines += [
-            "",
-            "---",
-            "_Auto-generated by [openclaw](https://github.com/Cyberdude01/openclaw)_",
-        ]
+        lines += ["", "---",
+                  "_Auto-generated by [openclaw](https://github.com/Cyberdude01/openclaw)_"]
         return "\n".join(lines) + "\n"
 
-    # ── Report 2: Decision Engine Summary ──────────────────────────────────────
+    # ── Report 2: Decision Engine Summary ─────────────────────────────────────
 
     def _build_decision_summary_report(self, ts: str) -> str:
         rows = self.db.all_signals(hours=48) if self.db else []
 
-        # Aggregate by trigger type
         by_trigger: Dict[str, int] = {}
         for r in rows:
             t = r["trigger"] or "unknown"
@@ -209,100 +283,118 @@ class DataExporter:
             "# Decision Engine Summary",
             f"\n> **Updated:** `{ts}` &nbsp;|&nbsp; All signals from the last 48 hours\n",
             "## Signal Distribution",
-            "| Trigger | Count |",
-            "|---------|-------|",
+            _row(["Trigger", "Count"]),
+            _row(["-"*20, "-"*5]),
         ]
         for trigger, count in sorted(by_trigger.items(), key=lambda x: -x[1]):
-            lines.append(f"| `{trigger}` | {count} |")
+            lines.append(_row([f"`{trigger}`", str(count)]))
 
         lines += [
             "",
             "## Signal Log",
-            "| Time (UTC) | Symbol | Outcome | Trigger | Confidence | P(UP) | Bucket | Elapsed% | Reasoning |",
-            "|------------|--------|---------|---------|------------|-------|--------|----------|-----------|",
+            _row(["Time (ET)", "Symbol", "Slug", "Outcome", "Trigger",
+                  "Confidence", "P(UP)", "Bucket", "Elapsed%", "Reasoning"]),
+            _row(["-"*15, "-"*6, "-"*17, "-"*7, "-"*20,
+                  "-"*10, "-"*5, "-"*14, "-"*8, "-"*50]),
         ]
         for r in rows:
+            slug   = _SLUG_FOR.get(r["symbol"], r["symbol"])
             bucket = f"{r['vol_bucket']}+{r['trend_bucket']}" if r["vol_bucket"] else "—"
-            prob   = f"{r['prob_up']*100:.1f}%" if r["prob_up"] is not None else "—"
-            el     = f"{r['elapsed_pct']*100:.0f}%" if r["elapsed_pct"] is not None else "—"
-            # Truncate reasoning for table display; full text is preserved in DB
             reason = (r["reasoning"] or "")[:120].replace("|", "\\|")
-            lines.append(
-                f"| `{str(r['ts'])[:19]}` | {r['symbol']} | **{r['outcome']}** "
-                f"| `{r['trigger'] or '—'}` | {r['confidence']:.3f} "
-                f"| {prob} | {bucket} | {el} | {reason} |"
-            )
+            lines.append(_row([
+                f"`{_to_et(r['ts'])}`",
+                r["symbol"],
+                slug,
+                f"**{r['outcome']}**",
+                f"`{r['trigger'] or '—'}`",
+                _f(r["confidence"], ".3f"),
+                _pct(r["prob_up"]),
+                bucket,
+                _pct(r["elapsed_pct"]),
+                reason,
+            ]))
 
         if not rows:
-            lines.append("| — | No signals yet | — | — | — | — | — | — | — |")
+            lines.append(_row(["—"] * 10))
 
-        lines += [
-            "",
-            "---",
-            "_Auto-generated by [openclaw](https://github.com/Cyberdude01/openclaw)_",
-        ]
+        lines += ["", "---",
+                  "_Auto-generated by [openclaw](https://github.com/Cyberdude01/openclaw)_"]
         return "\n".join(lines) + "\n"
 
     # ── Report 3: Decision Tracker ─────────────────────────────────────────────
 
     def _build_decision_tracker_report(self, ts: str) -> str:
-        rows   = self.db.all_trades()  if self.db else []
+        rows    = self.db.all_trades()    if self.db else []
         summary = self.db.trade_summary() if self.db else {}
 
-        total = summary.get("total", 0) or 0
-        wins  = summary.get("wins",  0) or 0
-        losses= summary.get("losses",0) or 0
-        arbs  = summary.get("arb_trades", 0) or 0
-        pnl   = summary.get("total_pnl", 0.0) or 0.0
+        total  = int(summary.get("total",      0) or 0)
+        wins   = int(summary.get("wins",       0) or 0)
+        losses = int(summary.get("losses",     0) or 0)
+        arbs   = int(summary.get("arb_trades", 0) or 0)
+        pnl    = float(summary.get("total_pnl", 0.0) or 0.0)
+        pending = total - wins - losses - arbs
         win_rate = f"{wins/total*100:.1f}%" if total > 0 else "—"
+        pnl_str  = f"{'+'if pnl>=0 else ''}${pnl:.4f}"
 
         lines = [
             "# Decision Tracker",
-            f"\n> **Updated:** `{ts}` &nbsp;|&nbsp; Historical log of every trade taken\n",
+            f"\n> **Updated:** `{ts}` &nbsp;|&nbsp; Full trade history — refreshed every 5 minutes\n",
             "## Summary",
-            "| Total Trades | Wins | Losses | ARB | Win Rate | Total P&L |",
-            "|-------------|------|--------|-----|----------|-----------|",
-            f"| {total} | {wins} | {losses} | {arbs} | {win_rate} | "
-            f"{'+'if pnl>=0 else ''}${pnl:.4f} |",
+            _row(["Total", "Wins", "Losses", "ARB", "Pending", "Win Rate", "Total P&L"]),
+            _row(["-"*5,   "-"*4,  "-"*6,    "-"*3, "-"*7,    "-"*8,      "-"*10]),
+            _row([str(total), str(wins), str(losses), str(arbs),
+                  str(pending), win_rate, pnl_str]),
             "",
             "## Trade Log",
-            "| Entry Time | Symbol | Outcome | Trigger | Entry Price | Size | "
-            "Mode | Resolved At | Winner | Result | P&L | Reasoning |",
-            "|------------|--------|---------|---------|-------------|------|"
-            "------|-------------|--------|--------|-----|-----------|",
+            _row(["Entry Time (ET)", "Symbol", "Slug", "Outcome", "Trigger",
+                  "Entry Price", "Size (USDC)", "Mode",
+                  "Resolved (ET)", "Winner", "Result", "P&L", "Reasoning"]),
+            _row(["-"*15, "-"*6, "-"*17, "-"*7, "-"*20,
+                  "-"*11, "-"*11, "-"*5,
+                  "-"*14, "-"*6, "-"*8, "-"*9, "-"*50]),
         ]
+
+        _RESULT_ICON = {
+            "positive": "✅ Win",
+            "negative": "❌ Loss",
+            "arb":      "💰 ARB",
+        }
 
         for r in rows:
-            res_time = str(r["resolved_at"] or "")[:19] or "pending"
+            slug     = _SLUG_FOR.get(r["symbol"], r["symbol"])
+            res_time = _to_et(r["resolved_at"]) if r["resolved_at"] else "⏳ Pending"
             winner   = r["resolution"] or "—"
-            result   = r["result"]     or "pending"
-            pnl_cell = f"{'+'if (r['pnl'] or 0)>=0 else ''}${(r['pnl'] or 0):.4f}" \
-                       if r["pnl"] is not None else "pending"
-            result_fmt = {
-                "positive": "✅ +",
-                "negative": "❌ −",
-                "arb":      "💰 arb",
-                "pending":  "⏳",
-            }.get(result, result)
-            reason = (r["reasoning"] or "")[:100].replace("|", "\\|")
-            lines.append(
-                f"| `{str(r['ts'])[:19]}` | {r['symbol']} | **{r['outcome']}** "
-                f"| `{r['trigger'] or '—'}` | {r['entry_price']:.4f} "
-                f"| ${r['size']:.2f} | {r['mode']} "
-                f"| `{res_time}` | {winner} | {result_fmt} | {pnl_cell} | {reason} |"
-            )
+            result   = r["result"]     or "⏳ Pending"
+            result_s = _RESULT_ICON.get(result, result)
+            pnl_v    = r["pnl"]
+            pnl_cell = f"{'+'if (pnl_v or 0)>=0 else ''}${(pnl_v or 0):.4f}" \
+                       if pnl_v is not None else "⏳"
+            reason   = (r["reasoning"] or "")[:100].replace("|", "\\|")
+
+            lines.append(_row([
+                f"`{_to_et(r['ts'])}`",
+                r["symbol"],
+                slug,
+                f"**{r['outcome']}**",
+                f"`{r['trigger'] or '—'}`",
+                _price(r["entry_price"]),
+                f"${r['size']:.2f}",
+                r["mode"] or "—",
+                res_time,
+                winner,
+                result_s,
+                pnl_cell,
+                reason,
+            ]))
 
         if not rows:
-            lines.append("| — | No trades yet | — | — | — | — | — | — | — | — | — | — |")
+            lines.append(_row(["—"] * 13))
 
-        lines += [
-            "",
-            "---",
-            "_Auto-generated by [openclaw](https://github.com/Cyberdude01/openclaw)_",
-        ]
+        lines += ["", "---",
+                  "_Auto-generated by [openclaw](https://github.com/Cyberdude01/openclaw)_"]
         return "\n".join(lines) + "\n"
 
-    # ── README ─────────────────────────────────────────────────────────────────
+    # ── README ────────────────────────────────────────────────────────────────
 
     def _build_readme(self, ts: str, markets: dict, trades: list, portfolio: dict) -> str:
         mode = "LIVE" if POLY_API_KEY else "PAPER"
@@ -310,50 +402,64 @@ class DataExporter:
             "# Polymarket 15M Data Feed",
             f"\n> **Mode:** {mode} &nbsp;|&nbsp; **Updated:** `{ts}`\n",
             "## Live Markets",
-            "| Symbol | UP | DOWN | Elapsed | Bucket | Dir@60% | Dir@80% | Dir@90% |",
-            "|--------|----|------|---------|--------|---------|---------|---------|",
+            _row(["Symbol", "Slug", "UP", "DOWN", "Elapsed", "Remaining",
+                  "Bucket", "Dir@60%", "Dir@80%", "Dir@90%", "ARB"]),
+            _row(["-"*6, "-"*17, "-"*6, "-"*6, "-"*7, "-"*9,
+                  "-"*14, "-"*7, "-"*7, "-"*7, "-"*5]),
         ]
         for sym, d in markets.items():
-            up   = f"{d['up_price']:.3f}"   if d.get("up_price")   is not None else "—"
-            dn   = f"{d['down_price']:.3f}" if d.get("down_price") is not None else "—"
-            el   = f"{d.get('elapsed_pct',0)*100:.0f}%" if "elapsed_pct" in d else "—"
-            bk   = f"{d.get('vol_bucket','—')}+{d.get('trend_bucket','—')}" if "vol_bucket" in d else "—"
-            d60  = f"{d.get('dir_60pct',0.5)*100:.1f}%" if "dir_60pct" in d else "—"
-            d80  = f"{d.get('dir_80pct',0.5)*100:.1f}%" if "dir_80pct" in d else "—"
-            d90  = f"{d.get('dir_90pct',0.5)*100:.1f}%" if "dir_90pct" in d else "—"
-            lines.append(f"| **{sym}** | {up} | {dn} | {el} | {bk} | {d60} | {d80} | {d90} |")
+            slug = d.get("slug", _SLUG_FOR.get(sym, sym))
+            up   = _price(d.get("up_price"))
+            dn   = _price(d.get("down_price"))
+            el   = _pct(d.get("elapsed_pct"))
+            rem  = f"{d.get('remaining_sec', 0):.0f}s" if "remaining_sec" in d else "—"
+            bk   = (f"{d.get('vol_bucket')}+{d.get('trend_bucket')}"
+                    if "vol_bucket" in d else "—")
+            d60  = _pct(d.get("dir_60pct"))
+            d80  = _pct(d.get("dir_80pct"))
+            d90  = _pct(d.get("dir_90pct"))
+            arb  = f"${d['arb']:.4f}" if d.get("arb") else "—"
+            lines.append(_row([f"**{sym}**", slug, up, dn, el, rem, bk, d60, d80, d90, arb]))
 
         if portfolio:
-            pnl_color = "+" if portfolio.get("realized_pnl", 0) >= 0 else ""
+            pnl_sign = "+" if portfolio.get("realized_pnl", 0) >= 0 else ""
             lines += [
                 "\n## Portfolio",
-                f"| Balance | Realized P&L |",
-                f"|---------|-------------|",
-                f"| ${portfolio.get('balance',0):.2f} | {pnl_color}${portfolio.get('realized_pnl',0):.4f} |",
+                _row(["Balance", "Realized P&L"]),
+                _row(["-"*9, "-"*13]),
+                _row([f"${portfolio.get('balance', 0):.2f}",
+                      f"{pnl_sign}${portfolio.get('realized_pnl', 0):.4f}"]),
             ]
 
         if trades:
             lines += [
                 "\n## Recent Fills (last 10)",
-                "| Time (UTC) | Symbol | Outcome | Side | Size | Price | Trigger | Mode |",
-                "|------------|--------|---------|------|------|-------|---------|------|",
+                _row(["Time (ET)", "Symbol", "Outcome", "Side", "Size", "Price", "Trigger", "Mode"]),
+                _row(["-"*15, "-"*6, "-"*7, "-"*4, "-"*6, "-"*6, "-"*20, "-"*5]),
             ]
             for t in trades[-10:]:
-                lines.append(
-                    f"| `{t.get('ts','')[:19]}` | {t.get('symbol','')} | "
-                    f"{t.get('outcome','')} | {t.get('side','')} | "
-                    f"${t.get('size',0):.2f} | {t.get('price',0):.4f} | "
-                    f"`{t.get('trigger','—')}` | **{t.get('mode','').upper()}** |"
-                )
+                lines.append(_row([
+                    f"`{_to_et(t.get('ts', ''))}`",
+                    t.get("symbol", ""),
+                    t.get("outcome", ""),
+                    t.get("side", ""),
+                    f"${t.get('size', 0):.2f}",
+                    f"{t.get('price', 0):.4f}",
+                    f"`{t.get('trigger', '—')}`",
+                    f"**{t.get('mode', '').upper()}**",
+                ]))
 
         lines += [
             "",
             "## Reports",
-            "| Report | Description |",
-            "|--------|-------------|",
-            "| [Data Collector](reports/data_collector.md) | Raw + calculated data log (last 48h) |",
-            "| [Decision Summary](reports/decision_summary.md) | Analysis behind every signal |",
-            "| [Decision Tracker](reports/decision_tracker.md) | Full trade history with P&L |",
+            _row(["Report", "Description"]),
+            _row(["-"*30, "-"*40]),
+            _row(["[Data Collector](reports/data_collector.md)",
+                  "Raw + calculated data log (last 48 h)"]),
+            _row(["[Decision Summary](reports/decision_summary.md)",
+                  "Analysis behind every signal"]),
+            _row(["[Decision Tracker](reports/decision_tracker.md)",
+                  "Full trade history with entry, resolution and P&L"]),
             "",
             "---",
             "_Auto-generated by [openclaw](https://github.com/Cyberdude01/openclaw)_",
@@ -363,12 +469,13 @@ class DataExporter:
     # ── Snapshot + push ───────────────────────────────────────────────────────
 
     def _snapshot(self) -> None:
-        ts       = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        markets  = self._market_snapshot()
-        trades   = list(self.exec_log)[-50:]
-        signals  = [
+        ts      = _now_et()
+        markets = self._market_snapshot()
+        trades  = list(self.exec_log)[-50:]
+        signals = [
             {
                 "symbol":     s.symbol,
+                "slug":       _SLUG_FOR.get(s.symbol, s.symbol),
                 "outcome":    s.outcome.value,
                 "side":       s.side.value,
                 "size":       s.size,
@@ -380,7 +487,8 @@ class DataExporter:
             for s in list(self.signal_log)[-20:]
         ]
         portfolio = (
-            {"balance": round(self.book.balance, 2), "realized_pnl": round(self.book.realized_pnl, 4)}
+            {"balance": round(self.book.balance, 2),
+             "realized_pnl": round(self.book.realized_pnl, 4)}
             if self.book else {}
         )
 
@@ -390,9 +498,9 @@ class DataExporter:
         (d / "signals.json").write_text(json.dumps({"updated": ts, "data": signals}, indent=2))
         (d / "portfolio.json").write_text(json.dumps({"updated": ts, **portfolio}, indent=2))
 
-        # Three distinct Markdown reports (read from DB if available)
-        r = EXPORT_DIR / "reports"
+        # Three Markdown reports (read from DB)
         if self.db:
+            r = EXPORT_DIR / "reports"
             (r / "data_collector.md").write_text(self._build_data_collector_report(ts))
             (r / "decision_summary.md").write_text(self._build_decision_summary_report(ts))
             (r / "decision_tracker.md").write_text(self._build_decision_tracker_report(ts))
@@ -401,7 +509,7 @@ class DataExporter:
 
     def _push(self) -> None:
         _git(["add", "-A"])
-        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        ts = _now_et_iso()
         _git(["commit", "--allow-empty", "-m", f"data: {ts}"])
         ok = _git(["push", "origin", "HEAD"])
         if ok:
