@@ -60,6 +60,7 @@ from .config import (
     DB_PATH,
     DB_RETENTION_HOURS,
     DB_TRIM_INTERVAL,
+    GAMMA_API,
     SNAPSHOT_INTERVAL,
     SLUGS,
     SYMBOL_MAP,
@@ -233,7 +234,9 @@ async def _api_resolution_loop(db: Database) -> None:
     --------
     1. Query trades_executed for condition_ids with resolved_at IS NULL
        that are at least 20 minutes old (market must have expired).
-    2. Look up token_id_up for each condition_id from market_snapshots.
+    2. Look up token_id_up from market_snapshots (fast path).
+       If missing (trades made before snapshot loop was deployed), fall back
+       to the Gamma API: GET /markets?condition_id=<cid> to find the UP token.
     3. Call DATA_API /last-trade-price?token_id=<up_token>.
     4. Price >= 0.90 → UP wins; <= 0.10 → DOWN wins.
        If older than 30 min and price between 0.10–0.90: take the higher side.
@@ -261,11 +264,9 @@ async def _api_resolution_loop(db: Database) -> None:
 
             async with aiohttp.ClientSession() as session:
                 for row in rows:
-                    cid          = row["condition_id"]
-                    symbol       = row["symbol"] or "?"
-                    token_id_up  = row["token_id_up"]
-                    if not token_id_up:
-                        continue
+                    cid         = row["condition_id"]
+                    symbol      = row["symbol"] or "?"
+                    token_id_up = row["token_id_up"]
 
                     # Skip if trade is < 20 min old (market may still be live)
                     try:
@@ -279,6 +280,33 @@ async def _api_resolution_loop(db: Database) -> None:
                         age = 9999
 
                     if age < 1200:
+                        continue
+
+                    # ── Fallback: look up UP token from Gamma API ─────────────
+                    # This fires for trades made before the snapshot loop was
+                    # deployed (no market_snapshots rows for that condition_id).
+                    if not token_id_up:
+                        try:
+                            url = f"{GAMMA_API}/markets?condition_id={cid}"
+                            async with session.get(
+                                url, timeout=aiohttp.ClientTimeout(total=10)
+                            ) as r:
+                                data = await r.json()
+                            mkts = data if isinstance(data, list) else data.get("markets", [])
+                            for mkt in mkts:
+                                for tok in mkt.get("tokens", []):
+                                    if tok.get("outcome", "").upper() in ("UP",):
+                                        token_id_up = tok.get("token_id") or tok.get("tokenId")
+                                        break
+                                if token_id_up:
+                                    break
+                        except Exception as exc:
+                            console.log(f"[yellow]Gamma lookup ({cid[:8]}): {exc}[/yellow]")
+
+                    if not token_id_up:
+                        console.log(
+                            f"[dim]API resolution: no UP token for {cid[:12]}… (will retry)[/dim]"
+                        )
                         continue
 
                     try:
