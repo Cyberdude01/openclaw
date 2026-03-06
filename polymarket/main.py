@@ -347,16 +347,51 @@ async def _api_resolution_loop(db: Database) -> None:
             console.log(f"[yellow]API resolution loop error: {exc}[/yellow]")
 
 
-async def _redeem_loop() -> None:
+async def _fetch_clob_balance(session: aiohttp.ClientSession, _l2_headers) -> Optional[float]:
     """
-    Every 10 minutes, redeem all redeemable winning positions via the CLOB API.
+    Query GET /balance on the CLOB API and return the USDC balance as a float.
+
+    Returns None if the request fails or credentials are not set.
+    The endpoint returns JSON like {"balance": "13.210000"}.
+    """
+    try:
+        headers = {
+            "Content-Type": "application/json",
+            **_l2_headers("GET", "/balance"),
+        }
+        async with session.get(
+            f"{CLOB_API}/balance",
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as r:
+            if r.status != 200:
+                console.log(f"[yellow]Balance fetch returned {r.status}[/yellow]")
+                return None
+            data = await r.json()
+            # Response may be {"balance": "13.21"} or just a string/number
+            if isinstance(data, dict):
+                raw = data.get("balance") or data.get("USDC") or data.get("usdc")
+            else:
+                raw = data
+            return float(raw) if raw is not None else None
+    except Exception as exc:
+        console.log(f"[yellow]Balance fetch error: {exc}[/yellow]")
+        return None
+
+
+async def _redeem_loop(book: Optional["PositionBook"] = None) -> None:
+    """
+    Every 10 minutes, redeem all redeemable winning positions via the CLOB API
+    and sync the PositionBook balance with the actual on-chain USDC balance.
 
     Only active in live mode (POLY_API_KEY must be set).  In paper mode the
     coroutine exits immediately so it does not take up an asyncio slot.
 
-    Polymarket endpoint:
+    Polymarket endpoints:
+        GET  https://clob.polymarket.com/redeemable-positions
         POST https://clob.polymarket.com/redeem-positions
-        Body: {"conditionIds": ["0x…", …]}
+             Body: {"conditionIds": ["0x…", …]}
+        GET  https://clob.polymarket.com/balance
     Uses the same L2 HMAC-SHA256 auth headers as order submission.
     """
     if not POLY_API_KEY:
@@ -368,7 +403,6 @@ async def _redeem_loop() -> None:
     REDEEM_INTERVAL = 600   # 10 minutes
 
     while True:
-        await asyncio.sleep(REDEEM_INTERVAL)
         try:
             # Ask the CLOB for positions that are currently redeemable
             async with aiohttp.ClientSession() as session:
@@ -381,45 +415,62 @@ async def _redeem_loop() -> None:
                     headers=headers_get,
                     timeout=aiohttp.ClientTimeout(total=15),
                 ) as r:
-                    if r.status != 200:
+                    ok = r.status == 200
+                    if not ok:
                         console.log(f"[yellow]Redeem: /redeemable-positions returned {r.status}[/yellow]")
-                        continue
-                    redeemable = await r.json()
+                    redeemable = await r.json() if ok else []
 
-                # redeemable is a list of objects; extract conditionIds
-                if isinstance(redeemable, dict):
-                    redeemable = redeemable.get("data", []) or redeemable.get("positions", [])
+                if ok:
+                    # redeemable is a list of objects; extract conditionIds
+                    if isinstance(redeemable, dict):
+                        redeemable = redeemable.get("data", []) or redeemable.get("positions", [])
 
-                condition_ids = list({
-                    item.get("conditionId") or item.get("condition_id")
-                    for item in (redeemable or [])
-                    if item.get("conditionId") or item.get("condition_id")
-                })
+                    condition_ids = list({
+                        item.get("conditionId") or item.get("condition_id")
+                        for item in (redeemable or [])
+                        if item.get("conditionId") or item.get("condition_id")
+                    })
 
-                if not condition_ids:
-                    continue
-
-                console.log(f"[cyan]Redeem: {len(condition_ids)} condition_id(s) redeemable[/cyan]")
-
-                body_s  = json.dumps({"conditionIds": condition_ids})
-                headers_post = {
-                    "Content-Type": "application/json",
-                    **_l2_headers("POST", "/redeem-positions", body_s),
-                }
-                async with session.post(
-                    f"{CLOB_API}/redeem-positions",
-                    data=body_s,
-                    headers=headers_post,
-                    timeout=aiohttp.ClientTimeout(total=20),
-                ) as r:
-                    resp = await r.json()
-                    if r.status == 200:
-                        console.log(f"[green]Redeem successful: {resp}[/green]")
+                    if not condition_ids:
+                        # No positions to redeem — still sync balance so portfolio stays current
+                        if book is not None:
+                            bal = await _fetch_clob_balance(session, _l2_headers)
+                            if bal is not None:
+                                book.balance = bal
                     else:
-                        console.log(f"[yellow]Redeem POST returned {r.status}: {resp}[/yellow]")
+                        console.log(f"[cyan]Redeem: {len(condition_ids)} condition_id(s) redeemable[/cyan]")
+
+                        body_s  = json.dumps({"conditionIds": condition_ids})
+                        headers_post = {
+                            "Content-Type": "application/json",
+                            **_l2_headers("POST", "/redeem-positions", body_s),
+                        }
+                        async with session.post(
+                            f"{CLOB_API}/redeem-positions",
+                            data=body_s,
+                            headers=headers_post,
+                            timeout=aiohttp.ClientTimeout(total=20),
+                        ) as r:
+                            resp = await r.json()
+                            if r.status == 200:
+                                console.log(f"[green]Redeem successful: {resp}[/green]")
+                                # Sync the local PositionBook with the actual on-chain balance
+                                if book is not None:
+                                    bal = await _fetch_clob_balance(session, _l2_headers)
+                                    if bal is not None:
+                                        old = book.balance
+                                        book.balance = bal
+                                        console.log(
+                                            f"[green]Portfolio balance updated: "
+                                            f"${old:.2f} → ${bal:.2f}[/green]"
+                                        )
+                            else:
+                                console.log(f"[yellow]Redeem POST returned {r.status}: {resp}[/yellow]")
 
         except Exception as exc:
             console.log(f"[yellow]Redeem loop error: {exc}[/yellow]")
+
+        await asyncio.sleep(REDEEM_INTERVAL)
 
 
 async def _trim_loop(db: Database) -> None:
@@ -477,7 +528,7 @@ async def main(data_only: bool = False):
                 _snapshot_loop(state, db),
                 _resolution_loop(state, db),
                 _api_resolution_loop(db),
-                _redeem_loop(),
+                _redeem_loop(book=None),
                 _trim_loop(db),
                 _auto_restart_loop(AUTO_RESTART_HOURS),
             )
@@ -530,7 +581,7 @@ async def main(data_only: bool = False):
             _snapshot_loop(state, db),
             _resolution_loop(state, db),
             _api_resolution_loop(db),
-            _redeem_loop(),
+            _redeem_loop(book=book),
             _trim_loop(db),
             _auto_restart_loop(AUTO_RESTART_HOURS),
         )
