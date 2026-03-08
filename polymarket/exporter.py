@@ -430,6 +430,7 @@ class DataExporter:
 
         start_ts = self.db.get_stats_start_ts()
         rows     = self.db.trigger_stats_since(start_ts)
+        bkt_rows = self.db.bucket_stats_since(start_ts)
         start_et = _to_et(start_ts)
 
         # Organise by trigger → {UP: {...}, DOWN: {...}}
@@ -485,6 +486,80 @@ class DataExporter:
                 "**TOTAL**",
                 "—", "—", "—", "—", "—", "—",
                 f"**{grand_total}**", f"**{overall_wr}**",
+            ]))
+
+        # ── Bucket breakdown ──────────────────────────────────────────────────
+        # Aggregate bkt_rows by (bucket, trigger) regardless of UP/DOWN outcome
+        BUCKET_ORDER = ["HIGH+TREND", "HIGH+RANGE", "LOW+TREND", "LOW+RANGE", "unknown"]
+
+        # bucket → trigger → {total, wins, losses}
+        by_bucket: Dict[str, Dict[str, Dict[str, int]]] = {}
+        for r in bkt_rows:
+            bkt = (r["bucket"] or "unknown").upper()
+            trg = r["trigger"] or "unknown"
+            if bkt not in by_bucket:
+                by_bucket[bkt] = {}
+            if trg not in by_bucket[bkt]:
+                by_bucket[bkt][trg] = {"total": 0, "wins": 0, "losses": 0}
+            by_bucket[bkt][trg]["total"]  += r["total"]  or 0
+            by_bucket[bkt][trg]["wins"]   += r["wins"]   or 0
+            by_bucket[bkt][trg]["losses"] += r["losses"] or 0
+
+        if by_bucket:
+            lines += [
+                "",
+                "## Performance by Market Bucket",
+                "",
+                "> `HighVol+Trend` — high realized volatility, strongly trending. "
+                "`HighVol+Range` — high volatility, mean-reverting. "
+                "`LowVol+Trend` — quiet but directional. "
+                "`LowVol+Range` — quiet and choppy.\n",
+                _row(["Bucket", "Trigger", "Trades", "Wins", "Losses", "Win Rate"]),
+                _row(["-"*14, "-"*22, "-"*6, "-"*4, "-"*6, "-"*8]),
+            ]
+
+            # Canonical display names
+            _BKT_DISPLAY = {
+                "HIGH+TREND": "HighVol+Trend",
+                "HIGH+RANGE": "HighVol+Range",
+                "LOW+TREND":  "LowVol+Trend",
+                "LOW+RANGE":  "LowVol+Range",
+            }
+
+            bkt_grand_total = bkt_grand_wins = bkt_grand_losses = 0
+            for bkt_key in BUCKET_ORDER:
+                if bkt_key not in by_bucket:
+                    continue
+                display = _BKT_DISPLAY.get(bkt_key, bkt_key)
+                bkt_total = bkt_wins = bkt_losses = 0
+                first = True
+                for trg in sorted(by_bucket[bkt_key].keys()):
+                    d = by_bucket[bkt_key][trg]
+                    bkt_total  += d["total"]
+                    bkt_wins   += d["wins"]
+                    bkt_losses += d["losses"]
+                    wr = f"{d['wins']/(d['wins']+d['losses'])*100:.1f}%" if (d["wins"] + d["losses"]) > 0 else "—"
+                    lines.append(_row([
+                        f"**{display}**" if first else "",
+                        f"`{trg}`",
+                        str(d["total"]), str(d["wins"]), str(d["losses"]), wr,
+                    ]))
+                    first = False
+                # Bucket subtotal
+                bkt_wr = f"{bkt_wins/(bkt_wins+bkt_losses)*100:.1f}%" if (bkt_wins + bkt_losses) > 0 else "—"
+                lines.append(_row(["", f"*subtotal*", f"*{bkt_total}*", f"*{bkt_wins}*", f"*{bkt_losses}*", f"*{bkt_wr}*"]))
+                bkt_grand_total  += bkt_total
+                bkt_grand_wins   += bkt_wins
+                bkt_grand_losses += bkt_losses
+
+            bkt_overall_wr = (
+                f"{bkt_grand_wins/(bkt_grand_wins+bkt_grand_losses)*100:.1f}%"
+                if (bkt_grand_wins + bkt_grand_losses) > 0 else "—"
+            )
+            lines.append(_row([
+                "**TOTAL**", "",
+                f"**{bkt_grand_total}**", f"**{bkt_grand_wins}**",
+                f"**{bkt_grand_losses}**", f"**{bkt_overall_wr}**",
             ]))
 
         lines += ["", "---",

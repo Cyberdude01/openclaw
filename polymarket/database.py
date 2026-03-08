@@ -372,6 +372,38 @@ class Database:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def bucket_stats_since(self, start_ts: str) -> List[Dict[str, Any]]:
+        """
+        Return resolved trade counts (wins/losses) grouped by vol+trend bucket,
+        for trades placed on or after start_ts.  Bucket is looked up from the
+        matching decision_signal (same condition_id + trigger + outcome).
+        Trades with no matching signal (rare) fall back to 'unknown'.
+        """
+        rows = self._conn.execute(
+            """
+            SELECT COALESCE(d.vol_bucket || '+' || d.trend_bucket, 'unknown') AS bucket,
+                   t.trigger,
+                   t.outcome,
+                   COUNT(*)                                               AS total,
+                   SUM(CASE WHEN t.result = 'positive' THEN 1 ELSE 0 END) AS wins,
+                   SUM(CASE WHEN t.result = 'negative' THEN 1 ELSE 0 END) AS losses
+            FROM   trades_executed t
+            LEFT JOIN (
+                SELECT condition_id, trigger, outcome,
+                       vol_bucket, trend_bucket
+                FROM   decision_signals
+                GROUP  BY condition_id, trigger, outcome
+            ) d ON d.condition_id = t.condition_id
+                AND d.trigger    = t.trigger
+                AND d.outcome    = t.outcome
+            WHERE  t.ts >= ?
+            GROUP  BY bucket, t.trigger, t.outcome
+            ORDER  BY bucket, t.trigger, t.outcome
+            """,
+            [start_ts],
+        ).fetchall()
+        return [dict(r) for r in rows]
+
     def opposing_entries_this_window(self, condition_id: str, outcome: str) -> int:
         """
         Count trades already placed for this condition_id in the OPPOSITE direction.
