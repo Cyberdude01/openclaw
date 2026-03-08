@@ -490,12 +490,12 @@ class DataExporter:
 
         # ── Bucket breakdown ──────────────────────────────────────────────────
         # Aggregate bkt_rows by (bucket, trigger) regardless of UP/DOWN outcome
-        BUCKET_ORDER = ["HIGH+TREND", "HIGH+RANGE", "LOW+TREND", "LOW+RANGE", "unknown"]
+        BUCKET_ORDER = ["HighVol+Trend", "HighVol+Range", "LowVol+Trend", "LowVol+Range", "unknown"]
 
         # bucket → trigger → {total, wins, losses}
         by_bucket: Dict[str, Dict[str, Dict[str, int]]] = {}
         for r in bkt_rows:
-            bkt = (r["bucket"] or "unknown").upper()
+            bkt = r["bucket"] or "unknown"
             trg = r["trigger"] or "unknown"
             if bkt not in by_bucket:
                 by_bucket[bkt] = {}
@@ -518,12 +518,13 @@ class DataExporter:
                 _row(["-"*14, "-"*22, "-"*6, "-"*4, "-"*6, "-"*8]),
             ]
 
-            # Canonical display names
+            # Bucket keys match vol_bucket.value + '+' + trend_bucket.value from models.py
+            # e.g. "HighVol+Trend", "HighVol+Range", "LowVol+Trend", "LowVol+Range"
             _BKT_DISPLAY = {
-                "HIGH+TREND": "HighVol+Trend",
-                "HIGH+RANGE": "HighVol+Range",
-                "LOW+TREND":  "LowVol+Trend",
-                "LOW+RANGE":  "LowVol+Range",
+                "HighVol+Trend": "HighVol+Trend",
+                "HighVol+Range": "HighVol+Range",
+                "LowVol+Trend":  "LowVol+Trend",
+                "LowVol+Range":  "LowVol+Range",
             }
 
             bkt_grand_total = bkt_grand_wins = bkt_grand_losses = 0
