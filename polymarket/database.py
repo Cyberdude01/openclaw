@@ -123,6 +123,11 @@ CREATE TABLE IF NOT EXISTS market_resolutions (
     final_down_price REAL
 );
 
+CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_snap_ts     ON market_snapshots(ts);
 CREATE INDEX IF NOT EXISTS idx_snap_sym    ON market_snapshots(symbol);
 CREATE INDEX IF NOT EXISTS idx_sig_ts      ON decision_signals(ts);
@@ -151,6 +156,16 @@ class Database:
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
+        # Initialise stats_start_ts once (records when the new tracking epoch began)
+        existing = self._conn.execute(
+            "SELECT value FROM settings WHERE key = 'stats_start_ts'"
+        ).fetchone()
+        if not existing:
+            self._conn.execute(
+                "INSERT INTO settings (key, value) VALUES ('stats_start_ts', ?)",
+                [datetime.now(timezone.utc).isoformat()],
+            )
+            self._conn.commit()
 
     def close(self) -> None:
         self._conn.close()
@@ -318,6 +333,42 @@ class Database:
             WHERE  resolved_at IS NOT NULL
             GROUP  BY trigger, outcome
             """
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_stats_start_ts(self) -> str:
+        """Return the timestamp from which trigger performance stats are tracked."""
+        row = self._conn.execute(
+            "SELECT value FROM settings WHERE key = 'stats_start_ts'"
+        ).fetchone()
+        return row["value"] if row else datetime.now(timezone.utc).isoformat()
+
+    def has_trade_for_condition(self, condition_id: str) -> bool:
+        """Return True if any trade has been recorded for this market window."""
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM trades_executed WHERE condition_id = ?",
+            [condition_id],
+        ).fetchone()
+        return (row["n"] if row else 0) > 0
+
+    def trigger_stats_since(self, start_ts: str) -> List[Dict[str, Any]]:
+        """
+        Return resolved trade counts (wins/losses) grouped by trigger and outcome,
+        for trades placed on or after start_ts.
+        """
+        rows = self._conn.execute(
+            """
+            SELECT trigger,
+                   outcome,
+                   COUNT(*)                                              AS total,
+                   SUM(CASE WHEN result = 'positive' THEN 1 ELSE 0 END) AS wins,
+                   SUM(CASE WHEN result = 'negative' THEN 1 ELSE 0 END) AS losses
+            FROM   trades_executed
+            WHERE  ts >= ?
+            GROUP  BY trigger, outcome
+            ORDER  BY trigger, outcome
+            """,
+            [start_ts],
         ).fetchall()
         return [dict(r) for r in rows]
 

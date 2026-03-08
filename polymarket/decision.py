@@ -34,6 +34,7 @@ from .config import (
     MIN_TRADE_SIZE,
     SLUGS,
     SYMBOL_MAP,
+    TRADE_SIZE,
 )
 from .database import Database
 from .feedback import AdaptiveThresholds
@@ -163,6 +164,7 @@ class DecisionEngine:
             if snap:
                 signals.extend(self._directional_signals(mkt, symbol, snap))
                 signals.extend(self._trend_signals(mkt, symbol, snap))
+                signals.extend(self._forced_trade_signals(mkt, symbol, snap))
         return signals
 
     # ── Arbitrage ─────────────────────────────────────────────────────────────
@@ -263,10 +265,9 @@ class DecisionEngine:
             if self.adaptive and self.adaptive.opposing_entry_exists(mkt.condition_id, outcome.value):
                 continue
 
-            # Size scales with edge; higher confidence → larger trade
+            # Fixed trade size: $5 per trade
             confidence = 0.5 + edge
-            size = MIN_TRADE_SIZE + (MAX_TRADE_SIZE - MIN_TRADE_SIZE) * (edge / 0.5)
-            size = min(size, MAX_POSITION - self.book.total_exposure(symbol))
+            size = min(TRADE_SIZE, MAX_POSITION - self.book.total_exposure(symbol))
             if size < MIN_TRADE_SIZE:
                 continue
 
@@ -290,7 +291,7 @@ class DecisionEngine:
                     f"P(UP)={prob_up:.3f} gives edge={edge:.3f} toward {direction_word}. "
                     f"Bucket={snap.vol_bucket.value}+{snap.trend_bucket.value} "
                     f"(RV60={snap.rv60:.5f}, Eff60={snap.eff60:.3f}). "
-                    f"Size scales with edge: ${round(size, 2):.2f} USDC @ conf={round(confidence, 3):.3f}."
+                    f"Fixed $5 USDC stake @ conf={round(confidence, 3):.3f}."
                     f"{adaptive_note}"
                 ),
             ))
@@ -342,10 +343,7 @@ class DecisionEngine:
                 continue
 
             price = getattr(token.order_book, price_attr, 0.5)
-            size  = min(
-                MIN_TRADE_SIZE + (MAX_TRADE_SIZE - MIN_TRADE_SIZE) * min(dev / 0.25, 1.0),
-                MAX_POSITION - self.book.total_exposure(symbol),
-            )
+            size  = min(TRADE_SIZE, MAX_POSITION - self.book.total_exposure(symbol))
             if size < MIN_TRADE_SIZE:
                 continue
 
@@ -364,10 +362,76 @@ class DecisionEngine:
                     f"TREND FOLLOW (HighVol+Trend, {mkt.elapsed_pct*100:.0f}% elapsed) — "
                     f"{outcome.value} token at {price:.3f} deviates {dev:.3f} from 0.50. "
                     f"Momentum continuation strategy: buying the already-winning leg. "
-                    f"Size=${round(size, 2):.2f} USDC (scales with deviation)."
+                    f"Fixed $5 USDC stake."
                 ),
             ))
         return signals
+
+    # ── Forced Trade (every market must be entered) ───────────────────────────
+
+    def _forced_trade_signals(
+        self, mkt: MarketInfo, symbol: str, snap: AnalyticsSnapshot,
+    ) -> List[TradeSignal]:
+        """
+        Guarantee at least one trade per market window.
+
+        Fires at the 60% elapsed mark if no trade has yet been placed for this
+        condition_id (checked in both the in-memory PositionBook and the DB).
+        Direction is chosen by whichever side has the higher probability estimate.
+        Size is always TRADE_SIZE ($5).
+        """
+        # Only fire within 30 s of the 60% threshold
+        delta = abs(mkt.elapsed_pct - DECISION_THRESHOLDS["60pct"])
+        if delta > (30 / MARKET_DURATION_SECONDS):
+            return []
+
+        # Skip if already in a position in memory
+        for outcome in (Outcome.UP, Outcome.DOWN):
+            if self.book.position_size(mkt.condition_id, outcome) > 0:
+                return []
+
+        # Skip if the DB already has a trade for this market window
+        if self.db and self.db.has_trade_for_condition(mkt.condition_id):
+            return []
+
+        # Choose direction based on the 60% probability estimate
+        prob_up = snap.dir_60pct if snap else 0.5
+        if prob_up >= 0.5:
+            outcome = Outcome.UP
+            token   = mkt.up_token
+        else:
+            outcome = Outcome.DOWN
+            token   = mkt.down_token
+
+        if not token or not token.order_book:
+            return []
+
+        # Stale-price guard
+        if self.adaptive and snap and self.adaptive.stale_prices(snap.up_price, snap.down_price):
+            return []
+
+        price = token.order_book.best_ask
+        size  = min(TRADE_SIZE, MAX_POSITION - self.book.total_exposure(symbol))
+        if size < MIN_TRADE_SIZE:
+            return []
+
+        return [TradeSignal(
+            symbol       = symbol,
+            market_id    = mkt.market_id,
+            condition_id = mkt.condition_id,
+            token_id     = token.token_id,
+            outcome      = outcome,
+            side         = Side.BUY,
+            size         = round(size, 2),
+            price        = round(price, 4),
+            confidence   = round(0.5 + abs(prob_up - 0.5), 3),
+            trigger      = "forced",
+            reason       = (
+                f"FORCED TRADE at 60% elapsed — no prior signal for this window. "
+                f"P(UP)={prob_up:.3f}, choosing {outcome.value}. "
+                f"Fixed $5 USDC stake (every market must be entered)."
+            ),
+        )]
 
     # ── Main Loop ─────────────────────────────────────────────────────────────
 

@@ -40,9 +40,10 @@ MIN_HISTORY_BARS    = 5             # Minimum bars before analytics are valid
 ANALYTICS_INTERVAL  = 60           # Recompute analytics every N seconds
 
 # ─── Trading ──────────────────────────────────────────────────────────────────
-# Minimum trade size (USDC)
-MIN_TRADE_SIZE      = 2.0
-MAX_TRADE_SIZE      = 50.0
+# Fixed trade size (USDC) — all trades are exactly $5
+TRADE_SIZE          = 5.0
+MIN_TRADE_SIZE      = 5.0
+MAX_TRADE_SIZE      = 5.0
 # Max position per market (USDC)
 MAX_POSITION        = 100.0
 # Minimum probability edge to trigger a trade (above 0.5 implied probability)
