@@ -485,6 +485,22 @@ async def _trim_loop(db: Database) -> None:
             console.log(f"[yellow]DB trim error: {exc}[/yellow]")
 
 
+async def _feedback_log_loop(decision: "DecisionEngine") -> None:
+    """
+    Every 5 minutes, log the current adaptive threshold state so operators
+    can see which trigger+direction combos have been suppressed or adjusted.
+    """
+    from .config import AUTO_RESTART_HOURS   # avoid circular at module level
+    while True:
+        await asyncio.sleep(300)
+        try:
+            if decision.adaptive:
+                for line in decision.adaptive.summary_lines():
+                    console.log(line)
+        except Exception as exc:
+            console.log(f"[yellow]Feedback log error: {exc}[/yellow]")
+
+
 async def _auto_restart_loop(hours: float) -> None:
     """
     Restart the process after `hours` hours.
@@ -584,6 +600,7 @@ async def main(data_only: bool = False):
             _redeem_loop(book=book),
             _trim_loop(db),
             _auto_restart_loop(AUTO_RESTART_HOURS),
+            _feedback_log_loop(decision),
         )
     except (KeyboardInterrupt, asyncio.CancelledError):
         pass

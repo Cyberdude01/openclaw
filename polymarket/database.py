@@ -300,6 +300,40 @@ class Database:
 
     # ── Trim ──────────────────────────────────────────────────────────────────
 
+    def win_rates_by_trigger(self) -> List[Dict[str, Any]]:
+        """
+        Return resolved trade win rates grouped by trigger + outcome.
+        Used by AdaptiveThresholds to tune edge requirements at runtime.
+        """
+        rows = self._conn.execute(
+            """
+            SELECT trigger,
+                   outcome,
+                   COUNT(*)                                             AS total,
+                   SUM(CASE WHEN result = 'positive' THEN 1 ELSE 0 END) AS wins,
+                   SUM(CASE WHEN result = 'negative' THEN 1 ELSE 0 END) AS losses,
+                   ROUND(AVG(CASE WHEN result IN ('positive','negative')
+                                  THEN pnl END), 4)                    AS avg_pnl
+            FROM   trades_executed
+            WHERE  resolved_at IS NOT NULL
+            GROUP  BY trigger, outcome
+            """
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def opposing_entries_this_window(self, condition_id: str, outcome: str) -> int:
+        """
+        Count trades already placed for this condition_id in the OPPOSITE direction.
+        Used to prevent simultaneous UP+DOWN bets on the same market window.
+        """
+        opposite = "DOWN" if outcome == "UP" else "UP"
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM trades_executed "
+            "WHERE condition_id = ? AND outcome = ? AND resolved_at IS NULL",
+            [condition_id, opposite],
+        ).fetchone()
+        return row["n"] if row else 0
+
     def trim(self, retention_hours: int = DB_RETENTION_HOURS) -> int:
         """
         Delete market_snapshots and decision_signals older than retention_hours.

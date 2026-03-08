@@ -36,6 +36,7 @@ from .config import (
     SYMBOL_MAP,
 )
 from .database import Database
+from .feedback import AdaptiveThresholds
 from .models import (
     AnalyticsSnapshot,
     MarketInfo,
@@ -143,8 +144,13 @@ class DecisionEngine:
         self.book       = book
         self.db         = db
         self.signal_log: Deque[TradeSignal] = deque(maxlen=50)
+        self.adaptive   = AdaptiveThresholds(db) if db else None
 
     def generate_signals(self) -> List[TradeSignal]:
+        # Refresh adaptive thresholds from DB if interval has elapsed
+        if self.adaptive:
+            self.adaptive.maybe_refresh()
+
         signals: List[TradeSignal] = []
         for slug in SLUGS:
             symbol = SYMBOL_MAP.get(slug, slug)
@@ -223,11 +229,8 @@ class DecisionEngine:
                 "90pct": snap.dir_90pct,
             }
             prob_up = dir_probs.get(label, 0.5)
-            edge = abs(prob_up - 0.5)
-            if edge < MIN_EDGE:
-                continue
 
-            # Determine side and token
+            # Determine direction before adaptive checks
             if prob_up > 0.5:
                 outcome = Outcome.UP
                 token   = mkt.up_token
@@ -240,6 +243,26 @@ class DecisionEngine:
             if not token:
                 continue
 
+            trigger_tag = f"directional_{label}"
+
+            # Adaptive: skip if historically suppressed
+            if self.adaptive and self.adaptive.is_suppressed(trigger_tag, outcome.value):
+                continue
+
+            # Adaptive: use per-(trigger, direction) edge threshold
+            min_edge_req = (
+                self.adaptive.edge_for(trigger_tag, outcome.value)
+                if self.adaptive else MIN_EDGE
+            )
+
+            edge = abs(prob_up - 0.5)
+            if edge < min_edge_req:
+                continue
+
+            # Opposing-entry guard: don't bet both sides of the same window
+            if self.adaptive and self.adaptive.opposing_entry_exists(mkt.condition_id, outcome.value):
+                continue
+
             # Size scales with edge; higher confidence → larger trade
             confidence = 0.5 + edge
             size = MIN_TRADE_SIZE + (MAX_TRADE_SIZE - MIN_TRADE_SIZE) * (edge / 0.5)
@@ -248,6 +271,9 @@ class DecisionEngine:
                 continue
 
             direction_word = "UP" if prob_up > 0.5 else "DOWN"
+            adaptive_note  = (
+                f" [adaptive edge={min_edge_req:.3f}]" if self.adaptive else ""
+            )
             signals.append(TradeSignal(
                 symbol       = symbol,
                 market_id    = mkt.market_id,
@@ -258,13 +284,14 @@ class DecisionEngine:
                 size         = round(size, 2),
                 price        = round(price, 4),
                 confidence   = round(confidence, 3),
-                trigger      = f"directional_{label}",
+                trigger      = trigger_tag,
                 reason       = (
                     f"DIRECTIONAL at {label} ({pct*100:.0f}% elapsed) — "
                     f"P(UP)={prob_up:.3f} gives edge={edge:.3f} toward {direction_word}. "
                     f"Bucket={snap.vol_bucket.value}+{snap.trend_bucket.value} "
                     f"(RV60={snap.rv60:.5f}, Eff60={snap.eff60:.3f}). "
                     f"Size scales with edge: ${round(size, 2):.2f} USDC @ conf={round(confidence, 3):.3f}."
+                    f"{adaptive_note}"
                 ),
             ))
         return signals
@@ -286,6 +313,12 @@ class DecisionEngine:
 
         up_p    = snap.up_price
         down_p  = snap.down_price
+
+        # Stale-price guard: in a binary market UP + DOWN ≈ 1.0.
+        # If both tokens show a high price (e.g. both 0.99), order books are stale.
+        if self.adaptive and self.adaptive.stale_prices(up_p, down_p):
+            return []
+
         dev_up  = up_p   - 0.50   # positive when UP  is the winning side (>0.50)
         dev_dn  = down_p - 0.50   # positive when DOWN is the winning side (>0.50)
 
@@ -299,6 +332,15 @@ class DecisionEngine:
             token = mkt.up_token if outcome == Outcome.UP else mkt.down_token
             if not token or not token.order_book:
                 continue
+
+            # Adaptive: skip if historically suppressed
+            if self.adaptive and self.adaptive.is_suppressed("trend_follow", outcome.value):
+                continue
+
+            # Opposing-entry guard: don't bet both sides of the same window
+            if self.adaptive and self.adaptive.opposing_entry_exists(mkt.condition_id, outcome.value):
+                continue
+
             price = getattr(token.order_book, price_attr, 0.5)
             size  = min(
                 MIN_TRADE_SIZE + (MAX_TRADE_SIZE - MIN_TRADE_SIZE) * min(dev / 0.25, 1.0),
