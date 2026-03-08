@@ -1,5 +1,12 @@
 # Project Memory
 
+## Time Zone Note
+
+The user's **local machine clock is not ET**. All service logs, report timestamps, and
+the `Updated:` field in the GitHub repo use **US Eastern Time (ET)**. When comparing
+a screenshot clock to a report timestamp, account for this offset — do not assume the
+service has stalled just because the times look far apart.
+
 ## Server Paths
 
 The production server runs the polymarket service from:
