@@ -77,3 +77,35 @@ SNAPSHOT_INTERVAL  = 60      # Write market snapshot to DB every 60 seconds
 # Set AUTO_RESTART_HOURS=24 in environment to auto-restart the process daily.
 # 0 disables the feature (default).
 AUTO_RESTART_HOURS = float(os.getenv("AUTO_RESTART_HOURS", "0"))
+
+# ─── Suppressed Signal Combinations ───────────────────────────────────────────
+# (vol_bucket.value, trend_bucket.value, trigger) tuples that are disabled based
+# on empirical performance analysis.  Signals matching any entry are dropped
+# before reaching the trader.
+#
+# ACTIVE per bucket (everything NOT listed here fires normally):
+#   HighVol+Trend : directional_90pct, forced_coin, forced_edge, pre_open, trend_follow
+#   HighVol+Range : directional_90pct, forced_coin, pre_open
+#   LowVol+Trend  : forced_coin, forced_edge, pre_open
+#   LowVol+Range  : forced_coin, forced_edge, pre_open
+SUPPRESSED_SIGNALS: frozenset = frozenset([
+    # ── HighVol+Trend ──────────────────────────────────────────────────────
+    ("HighVol", "Trend", "directional_60pct"),
+    ("HighVol", "Trend", "directional_80pct"),
+    ("HighVol", "Trend", "forced"),          # legacy unsplit trigger
+    # ── HighVol+Range ──────────────────────────────────────────────────────
+    ("HighVol", "Range", "directional_60pct"),
+    ("HighVol", "Range", "directional_80pct"),
+    ("HighVol", "Range", "forced"),          # legacy unsplit trigger
+    ("HighVol", "Range", "forced_edge"),
+    # ── LowVol+Trend ───────────────────────────────────────────────────────
+    ("LowVol",  "Trend", "directional_60pct"),
+    ("LowVol",  "Trend", "directional_80pct"),
+    ("LowVol",  "Trend", "directional_90pct"),
+    ("LowVol",  "Trend", "forced"),          # legacy unsplit trigger
+    # ── LowVol+Range ───────────────────────────────────────────────────────
+    ("LowVol",  "Range", "directional_60pct"),
+    ("LowVol",  "Range", "directional_80pct"),
+    ("LowVol",  "Range", "directional_90pct"),
+    ("LowVol",  "Range", "forced"),          # legacy unsplit trigger
+])

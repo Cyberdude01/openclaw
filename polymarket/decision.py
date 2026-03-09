@@ -33,6 +33,7 @@ from .config import (
     MIN_EDGE,
     MIN_TRADE_SIZE,
     SLUGS,
+    SUPPRESSED_SIGNALS,
     SYMBOL_MAP,
     TRADE_SIZE,
 )
@@ -60,6 +61,7 @@ class Position:
     size:         float    # USDC notional
     avg_price:    float
     pnl:          float = 0.0
+    triggers:     set   = field(default_factory=set)   # triggers that have filled
 
     def update(self, fill_price: float, fill_size: float, side: Side):
         if side == Side.BUY:
@@ -92,6 +94,11 @@ class PositionBook:
     def total_exposure(self, symbol: str) -> float:
         return sum(p.size for p in self._positions.values() if p.symbol == symbol)
 
+    def position_only_preopen(self, condition_id: str, outcome: Outcome) -> bool:
+        """True if a position exists but was placed exclusively by pre_open orders."""
+        p = self.get_position(condition_id, outcome)
+        return bool(p and p.size > 0 and p.triggers <= {"pre_open"})
+
     def record_fill(self, signal: TradeSignal, fill_price: float):
         key = self._key(signal.condition_id, signal.outcome)
         if key not in self._positions:
@@ -102,6 +109,7 @@ class PositionBook:
                 size         = 0.0,
                 avg_price    = fill_price,
             )
+        self._positions[key].triggers.add(signal.trigger)
         self._positions[key].update(fill_price, signal.size, signal.side)
         if signal.side == Side.BUY:
             self.balance -= signal.size * fill_price
@@ -169,6 +177,19 @@ class DecisionEngine:
                 signals.extend(self._directional_signals(mkt, symbol, snap))
                 signals.extend(self._trend_signals(mkt, symbol, snap))
                 signals.extend(self._forced_trade_signals(mkt, symbol, snap))
+
+        # Drop signals in suppressed (vol_bucket, trend_bucket, trigger) combos
+        if SUPPRESSED_SIGNALS:
+            filtered: List[TradeSignal] = []
+            for sig in signals:
+                snap = self.state.analytics.get(sig.symbol).last_snapshot
+                if snap:
+                    key = (snap.vol_bucket.value, snap.trend_bucket.value, sig.trigger)
+                    if key in SUPPRESSED_SIGNALS:
+                        continue
+                filtered.append(sig)
+            return filtered
+
         return signals
 
     # ── Pre-Open (5 min before next market) ───────────────────────────────────
@@ -463,13 +484,14 @@ class DecisionEngine:
         if delta > (30 / MARKET_DURATION_SECONDS):
             return []
 
-        # Skip if already in a position in memory
+        # Skip if already in a non-pre_open position in memory
         for outcome in (Outcome.UP, Outcome.DOWN):
-            if self.book.position_size(mkt.condition_id, outcome) > 0:
+            if (self.book.position_size(mkt.condition_id, outcome) > 0
+                    and not self.book.position_only_preopen(mkt.condition_id, outcome)):
                 return []
 
-        # Skip if the DB already has a trade for this market window
-        if self.db and self.db.has_trade_for_condition(mkt.condition_id):
+        # Skip if the DB already has a non-pre_open trade for this market window
+        if self.db and self.db.has_non_preopen_trade_for_condition(mkt.condition_id):
             return []
 
         # Choose direction based on the 60% probability estimate

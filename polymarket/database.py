@@ -453,6 +453,16 @@ class Database:
         ).fetchone()
         return (row["n"] if row else 0) > 0
 
+    def has_non_preopen_trade_for_condition(self, condition_id: str) -> bool:
+        """Return True if any non-pre_open trade exists for this condition_id.
+        Allows forced/directional signals to fire even after pre_open legs filled."""
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM trades_executed "
+            "WHERE condition_id = ? AND trigger != 'pre_open'",
+            [condition_id],
+        ).fetchone()
+        return (row["n"] if row else 0) > 0
+
     def snapshots_since(self, symbol: str, since_ts: str) -> List[Dict[str, Any]]:
         """
         Return all market_snapshots for *symbol* with ts > since_ts, ordered by ts.

@@ -359,11 +359,16 @@ class TraderAgent:
     # ── Deduplication ─────────────────────────────────────────────────────────
 
     def _already_entered(self, signal: TradeSignal) -> bool:
-        """Avoid double-entering the same market/outcome."""
+        """Avoid double-entering the same market/outcome.
+        pre_open positions do not block subsequent in-market signals."""
         pos = self.book.get_position(signal.condition_id, signal.outcome)
-        if pos and pos.size >= MIN_TRADE_SIZE:
-            return True
-        return False
+        if not pos or pos.size < MIN_TRADE_SIZE:
+            return False
+        # Allow non-pre_open triggers through even if a pre_open leg is filled
+        if signal.trigger != "pre_open" and self.book.position_only_preopen(
+                signal.condition_id, signal.outcome):
+            return False
+        return True
 
     # ── Main Loop ─────────────────────────────────────────────────────────────
 
