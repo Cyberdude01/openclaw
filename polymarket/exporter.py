@@ -604,9 +604,9 @@ class DataExporter:
             lines += [
                 f"## {sym}",
                 "",
-                _row(["Window (ET)", "Cond ID", "Bets", "Wins", "Losses", "Win Rate",
+                _row(["Window (ET)", "Market Slug", "Bets", "Wins", "Losses", "Win Rate",
                       "P&L (USDC)", "Outcome"]),
-                _row(["-"*19, "-"*10, "-"*4, "-"*4, "-"*6, "-"*8, "-"*10, "-"*7]),
+                _row(["-"*19, "-"*28, "-"*4, "-"*4, "-"*6, "-"*8, "-"*10, "-"*7]),
             ]
 
             sym_bets = sym_wins = sym_losses = sym_pnl = 0
@@ -615,14 +615,15 @@ class DataExporter:
                 wins   = r["wins"]         or 0
                 losses = r["losses"]       or 0
                 pnl    = r["total_pnl"]    or 0.0
-                cid    = (r["condition_id"] or "")[:10] + "…"
+                # Use full slug if available, else fall back to short condition_id
+                slug_display = r.get("slug") or ((r["condition_id"] or "")[:10] + "…")
                 ts_et  = _to_et(r["first_trade_ts"]) if r["first_trade_ts"] else "—"
                 wr     = f"{wins/(wins+losses)*100:.0f}%" if (wins + losses) > 0 else "—"
                 pnl_s  = f"+{pnl:.2f}" if pnl >= 0 else f"{pnl:.2f}"
                 winner = r["winning_outcome"] or "pending"
 
                 lines.append(_row([
-                    f"`{ts_et}`", f"`{cid}`",
+                    f"`{ts_et}`", f"`{slug_display}`",
                     str(bets), str(wins), str(losses), wr,
                     f"`{pnl_s}`", winner,
                 ]))
@@ -741,7 +742,7 @@ class DataExporter:
 
     # All columns from market_snapshots in display order
     _CSV_FIELDS = [
-        "ts", "symbol", "condition_id", "token_id_up", "token_id_down",
+        "ts", "symbol", "slug", "condition_id", "token_id_up", "token_id_down",
         "up_price", "down_price",
         "up_best_bid", "up_best_ask", "down_best_bid", "down_best_ask",
         "up_spread", "down_spread",

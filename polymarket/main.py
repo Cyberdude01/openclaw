@@ -151,6 +151,7 @@ async def _snapshot_loop(state: MarketState, db: Database) -> None:
                     "prob_020":         round(snap.prob_020, 4) if snap else None,
                     "market_start_ts":  mkt.start_time.isoformat(),
                     "market_end_ts":    mkt.end_time.isoformat(),
+                    "slug":             slug,
                 }
                 db.insert_snapshot(row)
         except Exception as exc:

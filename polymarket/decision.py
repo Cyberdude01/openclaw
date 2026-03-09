@@ -155,6 +155,10 @@ class DecisionEngine:
         signals: List[TradeSignal] = []
         for slug in SLUGS:
             symbol = SYMBOL_MAP.get(slug, slug)
+
+            # Pre-open orders on the NEXT market window (runs even if no active market)
+            signals.extend(self._pre_open_signals(slug, symbol))
+
             mkt    = self.state.get_current_market(slug)
             if not mkt or not mkt.is_active:
                 continue
@@ -165,6 +169,80 @@ class DecisionEngine:
                 signals.extend(self._directional_signals(mkt, symbol, snap))
                 signals.extend(self._trend_signals(mkt, symbol, snap))
                 signals.extend(self._forced_trade_signals(mkt, symbol, snap))
+        return signals
+
+    # ── Pre-Open (5 min before next market) ───────────────────────────────────
+
+    _PRE_OPEN_PRICE = 0.48   # Limit price for both legs
+    _PRE_OPEN_SIZE  = 5.0    # USDC per leg
+    _PRE_OPEN_SECS  = 300    # 5 minutes before open
+    _PRE_OPEN_WINDOW = 30    # ±30 s tolerance
+
+    def _pre_open_signals(self, slug: str, symbol: str) -> List[TradeSignal]:
+        """
+        5 minutes before the NEXT 15-minute market window opens, place two limit
+        orders — one UP and one DOWN — each at 0.48 for $5 USDC.
+
+        Rationale: placing below the ~0.50 fair value captures a small edge when
+        the market opens and order-book spreads are wide.  Both legs are placed so
+        the position is directionally neutral until the market develops.
+
+        Bucket context is taken from the CURRENT window's analytics snapshot since
+        the next window's regime is not yet knowable.
+        """
+        mkt_next = self.state.get_next_market(slug)
+        if not mkt_next:
+            return []
+
+        now = datetime.now(timezone.utc)
+        secs_until_open = (mkt_next.start_time - now).total_seconds()
+
+        # Only fire within the ±30 s window around 5 min before open
+        if not (self._PRE_OPEN_SECS - self._PRE_OPEN_WINDOW
+                <= secs_until_open
+                <= self._PRE_OPEN_SECS + self._PRE_OPEN_WINDOW):
+            return []
+
+        # Current window analytics for bucket context
+        snap = self.state.analytics.get(symbol).last_snapshot
+        bucket_note = (
+            f"Current regime: {snap.vol_bucket.value}+{snap.trend_bucket.value}."
+            if snap else ""
+        )
+
+        signals: List[TradeSignal] = []
+        for outcome, token in [
+            (Outcome.UP,   mkt_next.up_token),
+            (Outcome.DOWN, mkt_next.down_token),
+        ]:
+            if not token:
+                continue
+
+            # Skip if already placed this leg (in-memory or DB)
+            if self.book.position_size(mkt_next.condition_id, outcome) > 0:
+                continue
+            if self.db and self.db.has_trade_for_condition_outcome(
+                    mkt_next.condition_id, outcome.value):
+                continue
+
+            signals.append(TradeSignal(
+                symbol       = symbol,
+                market_id    = mkt_next.market_id,
+                condition_id = mkt_next.condition_id,
+                token_id     = token.token_id,
+                outcome      = outcome,
+                side         = Side.BUY,
+                size         = self._PRE_OPEN_SIZE,
+                price        = self._PRE_OPEN_PRICE,
+                confidence   = 0.52,
+                trigger      = "pre_open",
+                reason       = (
+                    f"PRE-OPEN limit order — {secs_until_open:.0f}s before market start. "
+                    f"Buying {outcome.value} at {self._PRE_OPEN_PRICE} "
+                    f"(below ~0.50 fair value). "
+                    f"{bucket_note}"
+                ),
+            ))
         return signals
 
     # ── Arbitrage ─────────────────────────────────────────────────────────────

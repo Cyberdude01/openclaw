@@ -68,7 +68,8 @@ CREATE TABLE IF NOT EXISTS market_snapshots (
     prob_020         REAL,
     -- Market window timestamps
     market_start_ts  TEXT,
-    market_end_ts    TEXT
+    market_end_ts    TEXT,
+    slug             TEXT
 );
 
 CREATE TABLE IF NOT EXISTS decision_signals (
@@ -156,6 +157,15 @@ class Database:
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
+        # Schema migrations (add columns that may not exist in older DBs)
+        for migration in [
+            "ALTER TABLE market_snapshots ADD COLUMN slug TEXT",
+        ]:
+            try:
+                self._conn.execute(migration)
+                self._conn.commit()
+            except Exception:
+                pass  # Column already exists
         # Initialise stats_start_ts once (records when the new tracking epoch began)
         existing = self._conn.execute(
             "SELECT value FROM settings WHERE key = 'stats_start_ts'"
@@ -407,8 +417,8 @@ class Database:
     def market_pnl_summary(self) -> List[Dict[str, Any]]:
         """
         Per-market-window P&L summary.  Returns one row per (symbol, condition_id)
-        with trade counts, wins, losses, and total realised P&L.
-        Trades with no resolution yet are included in totals but not in wins/losses.
+        with trade counts, wins, losses, total realised P&L, and slug.
+        Slug is looked up from market_snapshots (may be NULL if snapshots were trimmed).
         """
         rows = self._conn.execute(
             """
@@ -421,7 +431,11 @@ class Database:
                    SUM(CASE WHEN t.result = 'negative'     THEN 1 ELSE 0 END) AS losses,
                    SUM(CASE WHEN t.result = 'arb'          THEN 1 ELSE 0 END) AS arb_trades,
                    ROUND(SUM(COALESCE(t.pnl, 0)), 4)                      AS total_pnl,
-                   r.winning_outcome
+                   r.winning_outcome,
+                   (SELECT s.slug FROM market_snapshots s
+                    WHERE  s.condition_id = t.condition_id
+                      AND  s.slug IS NOT NULL
+                    LIMIT  1)                                             AS slug
             FROM   trades_executed t
             LEFT JOIN market_resolutions r USING (condition_id)
             GROUP  BY t.symbol, t.condition_id
@@ -429,6 +443,15 @@ class Database:
             """
         ).fetchall()
         return [dict(r) for r in rows]
+
+    def has_trade_for_condition_outcome(self, condition_id: str, outcome: str) -> bool:
+        """Return True if a trade already exists for this condition_id and outcome."""
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM trades_executed "
+            "WHERE condition_id = ? AND outcome = ?",
+            [condition_id, outcome],
+        ).fetchone()
+        return (row["n"] if row else 0) > 0
 
     def snapshots_since(self, symbol: str, since_ts: str) -> List[Dict[str, Any]]:
         """
