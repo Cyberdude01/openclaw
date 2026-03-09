@@ -571,6 +571,18 @@ class DataExporter:
 
     # ── Report 4b: Trigger Performance Summary v2 ─────────────────────────────
 
+    # Canonical trigger order — all known triggers always appear, even with 0s
+    _ALL_TRIGGERS = [
+        "pre_open",
+        "forced_coin",
+        "forced_edge",
+        "arb",
+        "directional_60pct",
+        "directional_80pct",
+        "directional_90pct",
+        "trend_follow",
+    ]
+
     def _build_trigger_summary_v2_report(self, ts: str) -> str:
         if not self.db:
             return "# Trigger Performance Summary v2\n\nNo data available.\n"
@@ -580,6 +592,8 @@ class DataExporter:
         start_et = _to_et(start_ts)
 
         SYMBOL_ORDER = ["BTC", "ETH", "SOL", "XRP"]
+        _ZERO: Dict = {"total": 0, "wins": 0, "losses": 0, "pending": 0,
+                       "total_pnl": 0.0, "avg_pnl": None}
 
         # Organise: symbol → trigger → stats
         by_sym: Dict[str, Dict[str, Dict]] = {s: {} for s in SYMBOL_ORDER}
@@ -593,69 +607,95 @@ class DataExporter:
             "# Trigger Performance Summary v2",
             f"\n> **Updated:** `{ts}` &nbsp;|&nbsp; **Tracking from:** `{start_et}`\n",
             "> Fresh epoch — tracks only trades placed after the v2 start date. "
-            "Includes realised P&L per trigger.\n",
+            "P&L is **net profit/loss** (stake not included in wins). "
+            "Pending = placed but market not yet resolved.\n",
         ]
 
-        grand_total = grand_wins = grand_losses = grand_pnl = 0.0
+        grand_total = grand_wins = grand_losses = grand_pending = 0
+        grand_pnl = 0.0
 
         for sym in SYMBOL_ORDER:
             sym_data = by_sym.get(sym, {})
-            if not sym_data:
+            # Always show the symbol table; show all triggers with at least 1 trade
+            # plus any trigger that has data (including 0-row triggers from known list
+            # only if they already appear elsewhere — skip completely empty symbols)
+            active_triggers = set(sym_data.keys())
+            if not active_triggers:
                 continue
+
+            # Show all canonical triggers; for ones with no data show 0s
+            trigger_list = [t for t in self._ALL_TRIGGERS if t in active_triggers] + \
+                           [t for t in sorted(active_triggers) if t not in self._ALL_TRIGGERS]
+            # Also show canonical triggers NOT yet seen, so user can verify absence
+            missing = [t for t in self._ALL_TRIGGERS if t not in active_triggers]
 
             lines += [
                 f"## {sym}",
                 "",
-                _row(["Trigger", "Trades", "Wins", "Losses", "Win Rate",
+                _row(["Trigger", "Trades", "Wins", "Losses", "Pending", "Win Rate",
                       "Total P&L", "Avg P&L"]),
-                _row(["-"*22, "-"*6, "-"*4, "-"*6, "-"*8, "-"*10, "-"*8]),
+                _row(["-"*22, "-"*6, "-"*4, "-"*6, "-"*7, "-"*8, "-"*10, "-"*8]),
             ]
 
-            sym_total = sym_wins = sym_losses = sym_pnl = 0
-            for trigger in sorted(sym_data.keys()):
-                d      = sym_data[trigger]
-                total  = d["total"]  or 0
-                wins   = d["wins"]   or 0
-                losses = d["losses"] or 0
-                tpnl   = d["total_pnl"] or 0.0
-                apnl   = d["avg_pnl"]
-                wr     = f"{wins/(wins+losses)*100:.1f}%" if (wins + losses) > 0 else "—"
-                tpnl_s = f"{'+'if tpnl>=0 else ''}${tpnl:.4f}"
-                apnl_s = f"{'+'if (apnl or 0)>=0 else ''}${(apnl or 0):.4f}" if apnl is not None else "—"
+            sym_total = sym_wins = sym_losses = sym_pending = 0
+            sym_pnl = 0.0
+            for trigger in trigger_list:
+                d       = sym_data.get(trigger, _ZERO)
+                total   = d["total"]   or 0
+                wins    = d["wins"]    or 0
+                losses  = d["losses"]  or 0
+                pending = d["pending"] or 0
+                tpnl    = d["total_pnl"] or 0.0
+                apnl    = d["avg_pnl"]
+                wr      = f"{wins/(wins+losses)*100:.1f}%" if (wins + losses) > 0 else "—"
+                tpnl_s  = f"{'+'if tpnl>=0 else ''}${tpnl:.4f}"
+                apnl_s  = f"{'+'if (apnl or 0)>=0 else ''}${(apnl or 0):.4f}" if apnl is not None else "—"
                 lines.append(_row([
                     f"`{trigger}`",
-                    str(total), str(wins), str(losses), wr, tpnl_s, apnl_s,
+                    str(total), str(wins), str(losses), str(pending),
+                    wr, tpnl_s, apnl_s,
                 ]))
-                sym_total  += total
-                sym_wins   += wins
-                sym_losses += losses
-                sym_pnl    += tpnl
+                sym_total   += total
+                sym_wins    += wins
+                sym_losses  += losses
+                sym_pending += pending
+                sym_pnl     += tpnl
 
-            sym_wr  = f"{sym_wins/(sym_wins+sym_losses)*100:.1f}%" if (sym_wins + sym_losses) > 0 else "—"
+            # Show canonical triggers that haven't fired yet (greyed out with dashes)
+            if missing:
+                for trigger in missing:
+                    lines.append(_row([
+                        f"`{trigger}` *(none)*",
+                        "0", "—", "—", "—", "—", "—", "—",
+                    ]))
+
+            sym_wr    = f"{sym_wins/(sym_wins+sym_losses)*100:.1f}%" if (sym_wins + sym_losses) > 0 else "—"
             sym_pnl_s = f"{'+'if sym_pnl>=0 else ''}${sym_pnl:.4f}"
             lines.append(_row([
                 f"**{sym} TOTAL**",
                 f"**{sym_total}**", f"**{sym_wins}**", f"**{sym_losses}**",
+                f"**{sym_pending}**",
                 f"**{sym_wr}**", f"**{sym_pnl_s}**", "",
             ]))
             lines.append("")
 
-            grand_total  += sym_total
-            grand_wins   += sym_wins
-            grand_losses += sym_losses
-            grand_pnl    += sym_pnl
+            grand_total   += sym_total
+            grand_wins    += sym_wins
+            grand_losses  += sym_losses
+            grand_pending += sym_pending
+            grand_pnl     += sym_pnl
 
         if grand_total == 0:
-            lines.append("> ℹ️ No resolved trades recorded since tracking started.")
+            lines.append("> ℹ️ No trades recorded since tracking started.")
         else:
-            grand_wr  = f"{grand_wins/(grand_wins+grand_losses)*100:.1f}%" if (grand_wins + grand_losses) > 0 else "—"
+            grand_wr    = f"{grand_wins/(grand_wins+grand_losses)*100:.1f}%" if (grand_wins + grand_losses) > 0 else "—"
             grand_pnl_s = f"{'+'if grand_pnl>=0 else ''}${grand_pnl:.4f}"
             lines += [
                 "---",
                 _row(["**GRAND TOTAL**",
-                      f"**{int(grand_total)}**", f"**{int(grand_wins)}**",
-                      f"**{int(grand_losses)}**", f"**{grand_wr}**",
-                      f"**{grand_pnl_s}**", ""]),
+                      f"**{grand_total}**", f"**{grand_wins}**",
+                      f"**{grand_losses}**", f"**{grand_pending}**",
+                      f"**{grand_wr}**", f"**{grand_pnl_s}**", ""]),
             ]
 
         lines += ["", "---",

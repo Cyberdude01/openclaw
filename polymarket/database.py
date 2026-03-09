@@ -166,6 +166,26 @@ class Database:
                 self._conn.commit()
             except Exception:
                 pass  # Column already exists
+        # One-shot data migration: fix pnl values stored as gross proceeds
+        # (size / entry_price) — correct to net profit (size / entry_price - size).
+        # Guarded by a settings flag so it only runs once.
+        if not self._conn.execute(
+            "SELECT 1 FROM settings WHERE key = 'pnl_net_migration_done'"
+        ).fetchone():
+            self._conn.execute(
+                """
+                UPDATE trades_executed
+                SET pnl = pnl - size
+                WHERE result IN ('positive', 'arb')
+                  AND pnl IS NOT NULL
+                  AND entry_price IS NOT NULL
+                  AND entry_price > 0
+                """
+            )
+            self._conn.execute(
+                "INSERT INTO settings (key, value) VALUES ('pnl_net_migration_done', '1')"
+            )
+            self._conn.commit()
         # Initialise stats_start_ts once (records when the new tracking epoch began)
         existing = self._conn.execute(
             "SELECT value FROM settings WHERE key = 'stats_start_ts'"
@@ -256,12 +276,11 @@ class Database:
         )
         # Back-fill the trades_executed table for this market.
         #
-        # Polymarket binary market P&L (total payout):
+        # Polymarket binary market net P&L:
         #   You spend `size` USDC to buy  size / entry_price  tokens.
-        #   If you win:  tokens pay $1 each → receive size / entry_price USDC
-        #                P&L = size / entry_price  (capital + profit returned)
-        #   If you lose: you forfeit the entire stake → pnl = -size
-        #   ARB:         total payout minus estimated round-trip fee (3%)
+        #   If you win:  net profit = size / entry_price - size
+        #   If you lose: net loss   = -size (full stake forfeited)
+        #   ARB:         net profit = size / entry_price - size - 0.03 * size (fee)
         self._conn.execute(
             """
             UPDATE trades_executed
@@ -273,8 +292,8 @@ class Database:
                                 ELSE                          'negative'
                               END,
                 pnl         = CASE
-                                WHEN trigger = 'arb'     THEN size / entry_price - 0.03 * size
-                                WHEN outcome = ?         THEN size / entry_price
+                                WHEN trigger = 'arb'     THEN size / entry_price - size - 0.03 * size
+                                WHEN outcome = ?         THEN size / entry_price - size
                                 ELSE                          -size
                               END
             WHERE condition_id = ? AND resolved_at IS NULL
@@ -433,19 +452,20 @@ class Database:
 
     def trigger_stats_v2_since(self, start_ts: str) -> List[Dict[str, Any]]:
         """
-        Resolved trade stats grouped by symbol + trigger, with P&L totals.
+        Trade stats grouped by symbol + trigger, with P&L totals and pending count.
         Used for the v2 trigger summary report.
         """
         rows = self._conn.execute(
             """
             SELECT symbol,
                    trigger,
-                   COUNT(*)                                               AS total,
-                   SUM(CASE WHEN result = 'positive' THEN 1 ELSE 0 END)  AS wins,
-                   SUM(CASE WHEN result = 'negative' THEN 1 ELSE 0 END)  AS losses,
-                   ROUND(SUM(COALESCE(pnl, 0)), 4)                       AS total_pnl,
+                   COUNT(*)                                                AS total,
+                   SUM(CASE WHEN result = 'positive'   THEN 1 ELSE 0 END) AS wins,
+                   SUM(CASE WHEN result = 'negative'   THEN 1 ELSE 0 END) AS losses,
+                   SUM(CASE WHEN resolved_at IS NULL    THEN 1 ELSE 0 END) AS pending,
+                   ROUND(SUM(COALESCE(pnl, 0)), 4)                        AS total_pnl,
                    ROUND(AVG(CASE WHEN result IN ('positive','negative')
-                                  THEN pnl END), 4)                      AS avg_pnl
+                                  THEN pnl END), 4)                       AS avg_pnl
             FROM   trades_executed
             WHERE  ts >= ?
             GROUP  BY symbol, trigger
