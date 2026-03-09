@@ -176,6 +176,16 @@ class Database:
                 [datetime.now(timezone.utc).isoformat()],
             )
             self._conn.commit()
+        # Initialise stats_start_ts_v2 independently (fresh epoch for v2 report)
+        existing_v2 = self._conn.execute(
+            "SELECT value FROM settings WHERE key = 'stats_start_ts_v2'"
+        ).fetchone()
+        if not existing_v2:
+            self._conn.execute(
+                "INSERT INTO settings (key, value) VALUES ('stats_start_ts_v2', ?)",
+                [datetime.now(timezone.utc).isoformat()],
+            )
+            self._conn.commit()
 
     def close(self) -> None:
         self._conn.close()
@@ -409,6 +419,37 @@ class Database:
             WHERE  t.ts >= ?
             GROUP  BY bucket, t.trigger, t.outcome
             ORDER  BY bucket, t.trigger, t.outcome
+            """,
+            [start_ts],
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_stats_start_ts_v2(self) -> str:
+        """Return the v2 epoch start timestamp (independent of v1)."""
+        row = self._conn.execute(
+            "SELECT value FROM settings WHERE key = 'stats_start_ts_v2'"
+        ).fetchone()
+        return row["value"] if row else datetime.now(timezone.utc).isoformat()
+
+    def trigger_stats_v2_since(self, start_ts: str) -> List[Dict[str, Any]]:
+        """
+        Resolved trade stats grouped by symbol + trigger, with P&L totals.
+        Used for the v2 trigger summary report.
+        """
+        rows = self._conn.execute(
+            """
+            SELECT symbol,
+                   trigger,
+                   COUNT(*)                                               AS total,
+                   SUM(CASE WHEN result = 'positive' THEN 1 ELSE 0 END)  AS wins,
+                   SUM(CASE WHEN result = 'negative' THEN 1 ELSE 0 END)  AS losses,
+                   ROUND(SUM(COALESCE(pnl, 0)), 4)                       AS total_pnl,
+                   ROUND(AVG(CASE WHEN result IN ('positive','negative')
+                                  THEN pnl END), 4)                      AS avg_pnl
+            FROM   trades_executed
+            WHERE  ts >= ?
+            GROUP  BY symbol, trigger
+            ORDER  BY symbol, trigger
             """,
             [start_ts],
         ).fetchall()
