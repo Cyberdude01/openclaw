@@ -425,7 +425,7 @@ class DecisionEngine:
             size         = round(size, 2),
             price        = round(price, 4),
             confidence   = round(0.5 + abs(prob_up - 0.5), 3),
-            trigger      = "forced",
+            trigger      = "forced_edge" if abs(prob_up - 0.5) > MIN_EDGE else "forced_coin",
             reason       = (
                 f"FORCED TRADE at 60% elapsed — no prior signal for this window. "
                 f"P(UP)={prob_up:.3f}, choosing {outcome.value}. "
