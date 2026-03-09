@@ -404,6 +404,61 @@ class Database:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def market_pnl_summary(self) -> List[Dict[str, Any]]:
+        """
+        Per-market-window P&L summary.  Returns one row per (symbol, condition_id)
+        with trade counts, wins, losses, and total realised P&L.
+        Trades with no resolution yet are included in totals but not in wins/losses.
+        """
+        rows = self._conn.execute(
+            """
+            SELECT t.symbol,
+                   t.condition_id,
+                   MIN(t.ts)                                              AS first_trade_ts,
+                   COUNT(*)                                               AS total_trades,
+                   SUM(CASE WHEN t.resolved_at IS NOT NULL THEN 1 ELSE 0 END) AS resolved,
+                   SUM(CASE WHEN t.result = 'positive'     THEN 1 ELSE 0 END) AS wins,
+                   SUM(CASE WHEN t.result = 'negative'     THEN 1 ELSE 0 END) AS losses,
+                   SUM(CASE WHEN t.result = 'arb'          THEN 1 ELSE 0 END) AS arb_trades,
+                   ROUND(SUM(COALESCE(t.pnl, 0)), 4)                      AS total_pnl,
+                   r.winning_outcome
+            FROM   trades_executed t
+            LEFT JOIN market_resolutions r USING (condition_id)
+            GROUP  BY t.symbol, t.condition_id
+            ORDER  BY t.symbol, first_trade_ts DESC
+            """
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def snapshots_since(self, symbol: str, since_ts: str) -> List[Dict[str, Any]]:
+        """
+        Return all market_snapshots for *symbol* with ts > since_ts, ordered by ts.
+        Used by the CSV exporter to append only new rows.
+        """
+        rows = self._conn.execute(
+            """
+            SELECT * FROM market_snapshots
+            WHERE  symbol = ? AND ts > ?
+            ORDER  BY ts
+            """,
+            [symbol, since_ts],
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_setting(self, key: str, default: str = "") -> str:
+        row = self._conn.execute(
+            "SELECT value FROM settings WHERE key = ?", [key]
+        ).fetchone()
+        return row["value"] if row else default
+
+    def set_setting(self, key: str, value: str) -> None:
+        self._conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [key, value],
+        )
+        self._conn.commit()
+
     def opposing_entries_this_window(self, condition_id: str, outcome: str) -> int:
         """
         Count trades already placed for this condition_id in the OPPOSITE direction.
