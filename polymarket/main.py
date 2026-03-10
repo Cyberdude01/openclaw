@@ -502,6 +502,102 @@ async def _feedback_log_loop(decision: "DecisionEngine") -> None:
             console.log(f"[yellow]Feedback log error: {exc}[/yellow]")
 
 
+async def _health_check_server(state: MarketState, db: Database) -> None:
+    """
+    Minimal HTTP server on HEALTH_CHECK_PORT (default 8765).
+
+    Responds to any GET request with a JSON health payload:
+      {"status": "ok", "updated": "<ET timestamp>", "strategy": "<version>",
+       "markets_tracked": 4, "last_push_age_s": <seconds since last export>}
+
+    Usage (from any machine that can reach the server):
+      curl http://<server-ip>:8765/health
+    """
+    import json as _json
+
+    port = int(os.getenv("HEALTH_CHECK_PORT", "8765"))
+
+    async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            await asyncio.wait_for(reader.read(2048), timeout=5.0)
+        except Exception:
+            pass
+        try:
+            last_push_ts = db.get_setting("health_last_push_ts", "")
+            age_s: Optional[float] = None
+            if last_push_ts:
+                try:
+                    age_s = round(
+                        (datetime.now(timezone.utc) -
+                         datetime.fromisoformat(last_push_ts.replace("Z", "+00:00"))
+                         ).total_seconds(), 1
+                    )
+                except Exception:
+                    pass
+
+            payload = _json.dumps({
+                "status":          "ok",
+                "updated":         datetime.now(timezone.utc).isoformat(),
+                "strategy":        os.getenv("STRATEGY_VERSION", "v1"),
+                "markets_tracked": len(SLUGS),
+                "last_push_age_s": age_s,
+            })
+            response = (
+                f"HTTP/1.1 200 OK\r\n"
+                f"Content-Type: application/json\r\n"
+                f"Content-Length: {len(payload)}\r\n"
+                f"Connection: close\r\n\r\n"
+                f"{payload}"
+            )
+            writer.write(response.encode())
+            await writer.drain()
+        except Exception:
+            pass
+        finally:
+            writer.close()
+
+    try:
+        server = await asyncio.start_server(_handle, "0.0.0.0", port)
+        console.log(f"[dim]Health check server listening on :{port}[/dim]")
+        async with server:
+            await server.serve_forever()
+    except Exception as exc:
+        console.log(f"[yellow]Health check server error: {exc}[/yellow]")
+
+
+async def _db_backup_loop(db: Database) -> None:
+    """
+    Daily SQLite backup — copies the live DB to ~/polymarket_backup_YYYY-MM-DD.db.
+    Keeps the 7 most recent backups; older ones are deleted automatically.
+
+    The first backup fires ~1 minute after startup so that an immediate restart
+    does not skip it.  Subsequent backups run every 24 hours.
+    """
+    import shutil
+    from pathlib import Path
+
+    await asyncio.sleep(60)   # short initial delay so startup settles first
+    while True:
+        try:
+            date_tag    = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            backup_path = Path.home() / f"polymarket_backup_{date_tag}.db"
+            shutil.copy2(db._path, backup_path)
+            console.log(f"[green]DB backup written: {backup_path}[/green]")
+
+            # Prune — keep only the 7 most recent daily backups
+            backups = sorted(Path.home().glob("polymarket_backup_*.db"))
+            for old in backups[:-7]:
+                old.unlink(missing_ok=True)
+                console.log(f"[dim]DB backup pruned: {old.name}[/dim]")
+
+            # Record timestamp so health check can surface it
+            db.set_setting("health_last_backup_ts", datetime.now(timezone.utc).isoformat())
+        except Exception as exc:
+            console.log(f"[yellow]DB backup error: {exc}[/yellow]")
+
+        await asyncio.sleep(86_400)   # 24 hours
+
+
 async def _auto_restart_loop(hours: float) -> None:
     """
     Restart the process after `hours` hours.
@@ -547,6 +643,8 @@ async def main(data_only: bool = False):
                 _api_resolution_loop(db),
                 _redeem_loop(book=None),
                 _trim_loop(db),
+                _health_check_server(state, db),
+                _db_backup_loop(db),
                 _auto_restart_loop(AUTO_RESTART_HOURS),
             )
         except (KeyboardInterrupt, asyncio.CancelledError):
@@ -600,6 +698,8 @@ async def main(data_only: bool = False):
             _api_resolution_loop(db),
             _redeem_loop(book=book),
             _trim_loop(db),
+            _health_check_server(state, db),
+            _db_backup_loop(db),
             _auto_restart_loop(AUTO_RESTART_HOURS),
             _feedback_log_loop(decision),
         )

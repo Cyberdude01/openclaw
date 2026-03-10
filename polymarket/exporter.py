@@ -147,6 +147,7 @@ class DataExporter:
         self.exec_log   = exec_log   if exec_log   is not None else []
         self.db         = db
         self._ready     = False
+        self._push_failures = 0   # consecutive push failure counter
 
     # ── Repo setup ────────────────────────────────────────────────────────────
 
@@ -589,7 +590,7 @@ class DataExporter:
         title: str,
         description: str,
         start_ts: str,
-        strategy: str,
+        strategy: Optional[str],
     ) -> str:
         """
         Generic trigger summary builder shared by v2, v1_Prod, v3, and v4 reports.
@@ -743,10 +744,11 @@ class DataExporter:
             description = (
                 "**V2.0 Dev strategy** — forced_coin and forced_edge suppressed. "
                 "Tests whether trend_follow and directional_90pct drive performance. "
-                "Expect: no forced_coin or forced_edge rows with trades."
+                "Strategy isolation is enforced at the instance level (separate STRATEGY_VERSION=v2 run). "
+                "Showing all trades since epoch — when running V2, forced rows will not appear."
             ),
             start_ts    = self.db.get_stats_start_ts_v3(),
-            strategy    = "v2",
+            strategy    = None,   # epoch-based isolation; strategy enforced at runtime
         )
 
     def _build_trigger_summary_v4_report(self, ts: str) -> str:
@@ -759,10 +761,11 @@ class DataExporter:
             description = (
                 "**V3.0 Dev strategy** — all triggers active (minimal suppression). "
                 "Expect: forced_coin, forced_edge, trend_follow, directional_90pct, "
-                "pre_open and arb visible for each market."
+                "pre_open and arb visible for each market. "
+                "Strategy isolation is enforced at the instance level (separate STRATEGY_VERSION=v3 run)."
             ),
             start_ts    = self.db.get_stats_start_ts_v4(),
-            strategy    = "v3",
+            strategy    = None,   # epoch-based isolation; strategy enforced at runtime
         )
 
     # ── Report 5: Market P&L Summary ──────────────────────────────────────────
@@ -1126,18 +1129,31 @@ class DataExporter:
         # Markdown reports (read from DB)
         if self.db:
             r = EXPORT_DIR / "reports"
-            (r / "data_collector.md").write_text(self._build_data_collector_report(ts))
-            (r / "decision_summary.md").write_text(self._build_decision_summary_report(ts))
-            (r / "decision_tracker.md").write_text(self._build_decision_tracker_report(ts))
-            (r / "trigger_summary.md").write_text(self._build_trigger_summary_report(ts))
-            (r / "trigger_summary_v2.md").write_text(self._build_trigger_summary_v2_report(ts))
-            (r / "trigger_summary_v1_Prod.md").write_text(self._build_trigger_summary_v1_prod_report(ts))
-            (r / "trigger_summary_v3.md").write_text(self._build_trigger_summary_v3_report(ts))
-            (r / "trigger_summary_v4.md").write_text(self._build_trigger_summary_v4_report(ts))
-            (r / "market_pnl.md").write_text(self._build_market_pnl_report(ts))
-            (r / "market_V1_pnl.md").write_text(self._build_market_v1_pnl_report(ts))
+            self._write_report(r / "data_collector.md",         self._build_data_collector_report(ts))
+            self._write_report(r / "decision_summary.md",       self._build_decision_summary_report(ts))
+            self._write_report(r / "decision_tracker.md",       self._build_decision_tracker_report(ts))
+            self._write_report(r / "trigger_summary.md",        self._build_trigger_summary_report(ts))
+            self._write_report(r / "trigger_summary_v2.md",     self._build_trigger_summary_v2_report(ts))
+            self._write_report(r / "trigger_summary_v1_Prod.md",self._build_trigger_summary_v1_prod_report(ts))
+            self._write_report(r / "trigger_summary_v3.md",     self._build_trigger_summary_v3_report(ts))
+            self._write_report(r / "trigger_summary_v4.md",     self._build_trigger_summary_v4_report(ts))
+            self._write_report(r / "market_pnl.md",             self._build_market_pnl_report(ts))
+            self._write_report(r / "market_V1_pnl.md",          self._build_market_v1_pnl_report(ts))
 
         (EXPORT_DIR / "README.md").write_text(self._build_readme(ts, markets, trades, portfolio))
+
+    _MAX_REPORT_BYTES = 900_000  # 900 KB — warn before GitHub's 1 MB render limit
+
+    def _write_report(self, path: "Path", content: str) -> None:
+        """Write a report file with a size guard warning."""
+        size = len(content.encode())
+        if size > self._MAX_REPORT_BYTES:
+            console.log(
+                f"[yellow]Report size warning: {path.name} is "
+                f"{size // 1024} KB (>{self._MAX_REPORT_BYTES // 1024} KB) "
+                f"— GitHub may not render it inline[/yellow]"
+            )
+        path.write_text(content)
 
     def _push(self) -> None:
         _git(["add", "-A"])
@@ -1146,8 +1162,21 @@ class DataExporter:
         ok = _git(["push", "origin", "HEAD"])
         if ok:
             console.log(f"[green]Exporter: pushed snapshot at {ts}[/green]")
+            self._push_failures = 0
+            if self.db:
+                self.db.set_setting("health_last_push_ts", datetime.now(timezone.utc).isoformat())
         else:
-            console.log("[yellow]Exporter: push failed (will retry next interval)[/yellow]")
+            self._push_failures += 1
+            if self._push_failures >= 3:
+                console.log(
+                    f"[red bold]Exporter: {self._push_failures} consecutive push failures — "
+                    f"check GITHUB_TOKEN and network connectivity![/red bold]"
+                )
+            else:
+                console.log(
+                    f"[yellow]Exporter: push failed ({self._push_failures}/3 "
+                    f"before alert — will retry next interval)[/yellow]"
+                )
 
     # ── Main loop ─────────────────────────────────────────────────────────────
 

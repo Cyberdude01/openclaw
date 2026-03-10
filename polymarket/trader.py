@@ -327,25 +327,34 @@ class TraderAgent:
         self._log.append(entry)
         self.book.record_fill(signal, fill_price)
 
-        # Persist to SQLite
+        # Persist to SQLite — for live mode, only record if the exchange accepted the order.
+        # Rejected orders (result=None) are NOT recorded so the trade log stays honest.
         if self.db:
             try:
-                self.db.insert_trade({
-                    "ts":               ts,
-                    "symbol":           signal.symbol,
-                    "condition_id":     signal.condition_id,
-                    "token_id":         signal.token_id,
-                    "outcome":          signal.outcome.value,
-                    "side":             signal.side.value,
-                    "size":             signal.size,
-                    "entry_price":      fill_price,
-                    "confidence":       signal.confidence,
-                    "trigger":          signal.trigger,
-                    "reasoning":        signal.reason,
-                    "mode":             mode,
-                    "order_id":         order_id,
-                    "strategy_version": STRATEGY_VERSION,
-                })
+                if not self._live or result is not None:
+                    self.db.insert_trade({
+                        "ts":               ts,
+                        "symbol":           signal.symbol,
+                        "condition_id":     signal.condition_id,
+                        "token_id":         signal.token_id,
+                        "outcome":          signal.outcome.value,
+                        "side":             signal.side.value,
+                        "size":             signal.size,
+                        "entry_price":      fill_price,
+                        "confidence":       signal.confidence,
+                        "trigger":          signal.trigger,
+                        "reasoning":        signal.reason,
+                        "mode":             mode,
+                        "order_id":         order_id,
+                        "strategy_version": STRATEGY_VERSION,
+                    })
+                else:
+                    from rich.console import Console as _C
+                    _C().log(
+                        f"[yellow]Live order REJECTED by exchange — "
+                        f"{signal.symbol}/{signal.outcome.value} {signal.trigger} "
+                        f"NOT recorded in trade log[/yellow]"
+                    )
             except Exception:
                 pass  # Never let DB errors interrupt execution
 

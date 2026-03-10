@@ -222,13 +222,19 @@ class Database:
             )
             self._conn.commit()
         # Initialise V2.0 (stats_start_ts_v3) and V3.0 (stats_start_ts_v4) dev epochs.
+        # Default to the v2 epoch start so dev reports immediately populate with
+        # historical data — strategy isolation is enforced by running separate instances.
         for epoch_key in ("stats_start_ts_v3", "stats_start_ts_v4"):
             if not self._conn.execute(
                 "SELECT 1 FROM settings WHERE key = ?", [epoch_key]
             ).fetchone():
+                v2_row = self._conn.execute(
+                    "SELECT value FROM settings WHERE key = 'stats_start_ts_v2'"
+                ).fetchone()
+                epoch_start = v2_row["value"] if v2_row else datetime.now(timezone.utc).isoformat()
                 self._conn.execute(
                     "INSERT INTO settings (key, value) VALUES (?, ?)",
-                    [epoch_key, datetime.now(timezone.utc).isoformat()],
+                    [epoch_key, epoch_start],
                 )
                 self._conn.commit()
 
