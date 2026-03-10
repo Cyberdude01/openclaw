@@ -133,7 +133,7 @@ async def run(execute: bool = False) -> None:
     async with aiohttp.ClientSession() as session:
 
         # ── Stage 2: Balance / Auth ───────────────────────────────────────────
-        print("\nStage 2 — L2 Auth (GET /balance)")
+        print("\nStage 2 — L2 Auth (GET /balance-allowance)")
         # First verify basic connectivity with a public endpoint
         try:
             async with session.get(
@@ -147,20 +147,26 @@ async def run(execute: bool = False) -> None:
         except Exception as exc:
             print(f"{_WARN}  CLOB /time failed: {exc}")
 
+        # Correct endpoint is /balance-allowance (not /balance)
+        _BALANCE_PATH = "/balance-allowance"
         try:
-            l2 = _l2_headers("GET", "/balance")
+            l2 = _l2_headers("GET", _BALANCE_PATH)
             headers = {"Content-Type": "application/json", **l2}
             masked_key = (l2.get("POLY-API-KEY") or "")[:8] + "…"
             print(f"{_INFO}  Headers: POLY-ADDRESS={l2.get('POLY-ADDRESS','?')[:10]}…  POLY-API-KEY={masked_key}")
             async with session.get(
-                f"{CLOB_API}/balance", headers=headers,
+                f"{CLOB_API}{_BALANCE_PATH}?asset_type=0&signature_type=0",
+                headers=headers,
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as r:
                 body = await r.text()
                 if r.status == 200:
-                    data    = json.loads(body)
-                    balance = float(data.get("balance") or data.get("USDC") or 0)
-                    print(f"{_PASS}  Status 200 — USDC balance: ${balance:.4f}")
+                    data      = json.loads(body)
+                    balance   = float(data.get("balance") or data.get("USDC") or
+                                      data.get("asset_balance") or 0)
+                    allowance = float(data.get("allowance") or 0)
+                    print(f"{_PASS}  Status 200 — USDC balance: ${balance:.4f}  allowance: ${allowance:.4f}")
+                    print(f"{_INFO}  Full response: {json.dumps(data)}")
                     results["auth_balance"] = "PASS"
                 elif r.status in (401, 403):
                     print(f"{_FAIL}  Status {r.status}: Auth rejected — credentials invalid or expired")
@@ -175,36 +181,43 @@ async def run(execute: bool = False) -> None:
             print(f"{_FAIL}  Exception: {exc}")
             results["auth_balance"] = "FAIL"
 
-        # ── Stage 3: Fetch live BTC market ────────────────────────────────────
-        print("\nStage 3 — Fetch live BTC 15-min market (Gamma API)")
+        # ── Stage 3: Fetch live crypto 15-min market (BTC or ETH) ────────────
+        print("\nStage 3 — Fetch live crypto 15-min market (Gamma API)")
         market: Optional[Dict[str, Any]] = None
         token_id_up: Optional[str]       = None
         condition_id: Optional[str]      = None
-        try:
-            async with session.get(
-                f"{GAMMA_API}/markets?tag=crypto&active=true&slug=btc-updown-15m",
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as r:
-                data = await r.json()
-            markets = data if isinstance(data, list) else data.get("markets", [])
-            if markets:
-                market       = markets[0]
-                condition_id = market.get("conditionId") or market.get("condition_id")
-                tokens       = market.get("tokens", [])
-                for tok in tokens:
-                    if tok.get("outcome", "").upper() == "UP":
-                        token_id_up = tok.get("token_id") or tok.get("tokenId")
-                        break
-                print(f"{_PASS}  Found market: {market.get('slug', '?')}")
-                print(f"{_INFO}  condition_id  = {condition_id}")
-                print(f"{_INFO}  token_id_up   = {token_id_up}")
-                results["market_fetch"] = "PASS"
-            else:
-                print(f"{_WARN}  No BTC 15-min market found (might be between windows)")
+        # Try BTC first, then ETH — markets alternate/run in parallel
+        _candidates = [
+            ("btc-updown-15m", "BTC"),
+            ("eth-updown-15m", "ETH"),
+        ]
+        for _slug_prefix, _symbol in _candidates:
+            try:
+                async with session.get(
+                    f"{GAMMA_API}/markets?tag=crypto&active=true&slug={_slug_prefix}",
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as r:
+                    data = await r.json()
+                markets = data if isinstance(data, list) else data.get("markets", [])
+                if markets:
+                    market       = markets[0]
+                    condition_id = market.get("conditionId") or market.get("condition_id")
+                    tokens       = market.get("tokens", [])
+                    for tok in tokens:
+                        if tok.get("outcome", "").upper() == "UP":
+                            token_id_up = tok.get("token_id") or tok.get("tokenId")
+                            break
+                    print(f"{_PASS}  Found {_symbol} market: {market.get('slug', '?')}")
+                    print(f"{_INFO}  condition_id  = {condition_id}")
+                    print(f"{_INFO}  token_id_up   = {token_id_up}")
+                    results["market_fetch"] = "PASS"
+                    break
+            except Exception as exc:
+                print(f"{_WARN}  {_symbol} fetch error: {exc}")
+        else:
+            if market is None:
+                print(f"{_WARN}  No active BTC or ETH 15-min market found (might be between windows)")
                 results["market_fetch"] = "WARN"
-        except Exception as exc:
-            print(f"{_FAIL}  Exception: {exc}")
-            results["market_fetch"] = "FAIL"
 
         # ── Stage 4: CLOB last-trade-price ────────────────────────────────────
         print("\nStage 4 — CLOB last-trade-price")
@@ -317,7 +330,7 @@ def _summary(results: Dict[str, str]) -> None:
              "WARN": "\033[93m⚠\033[0m", "SKIP": "\033[90m-\033[0m"}
     labels = {
         "credentials":  "Stage 1  Credentials",
-        "auth_balance": "Stage 2  L2 Auth / Balance",
+        "auth_balance": "Stage 2  L2 Auth / Balance-Allowance",
         "market_fetch": "Stage 3  Market Fetch (Gamma)",
         "clob_price":   "Stage 4  CLOB Price",
         "order_build":  "Stage 5  Order Build (dry-run)",
