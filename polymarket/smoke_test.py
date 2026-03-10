@@ -6,8 +6,8 @@ Diagnoses API connectivity and order submission in live mode.
 Stages
 ------
   Stage 1  Load & validate credentials from /etc/polymarket.env (or environment)
-  Stage 2  GET /balance  — confirm L2 auth headers work
-  Stage 3  Fetch a live BTC 15-min market via Gamma API
+  Stage 2  GET /balance-allowance  — confirm L2 auth headers work
+  Stage 3  Fetch a live BTC or ETH 15-min market via Gamma API
   Stage 4  GET last-trade-price  — confirm CLOB data access
   Stage 5  Build a signed EIP-712 order (dry-run by default)
   Stage 6  POST /order  — ONLY runs with --execute flag (REAL MONEY)
@@ -19,6 +19,9 @@ Usage (both forms work on the production server)
 
   # As a standalone script (from anywhere):
   python /root/polymarket/smoke_test.py
+
+  # Re-derive fresh API credentials from private key (fixes 401 errors):
+  python /root/polymarket/smoke_test.py --rederive
 
   # Real $1 order (REAL MONEY):
   python /root/polymarket/smoke_test.py --execute
@@ -352,13 +355,116 @@ def _summary(results: Dict[str, str]) -> None:
         print("  \033[92mAll tested stages passed.\033[0m\n")
 
 
+async def rederive_credentials() -> None:
+    """
+    Re-derive Polymarket API credentials from the private key.
+    Uses L1 EIP-712 auth (ClobAuthDomain) to call POST /auth/api-key.
+    Prints new POLY_API_KEY, POLY_API_SECRET, POLY_API_PASSPHRASE so the
+    user can paste them into /etc/polymarket.env.
+    """
+    import aiohttp
+    from eth_account import Account
+
+    print("\n" + "="*60)
+    print("  Polymarket Credential Re-Derivation")
+    print("="*60 + "\n")
+
+    private_key = os.environ.get("POLY_PRIVATE_KEY", "")
+    address     = os.environ.get("POLY_ADDRESS", "")
+    if not private_key or not address:
+        print(f"{_FAIL}  POLY_PRIVATE_KEY and POLY_ADDRESS must be set in /etc/polymarket.env")
+        return
+
+    try:
+        account = Account.from_key(private_key)
+    except Exception as exc:
+        print(f"{_FAIL}  Invalid POLY_PRIVATE_KEY: {exc}")
+        return
+
+    # EIP-712 L1 auth: ClobAuthDomain
+    ts    = int(time.time())
+    nonce = 0
+    domain = {
+        "name":    "ClobAuthDomain",
+        "version": "1",
+        "chainId": 137,
+    }
+    types = {
+        "ClobAuth": [
+            {"name": "address",   "type": "address"},
+            {"name": "timestamp", "type": "string"},
+            {"name": "nonce",     "type": "uint256"},
+            {"name": "message",   "type": "string"},
+        ]
+    }
+    message = {
+        "address":   address,
+        "timestamp": str(ts),
+        "nonce":     nonce,
+        "message":   "This message attests that I control the given wallet",
+    }
+    try:
+        signed = account.sign_typed_data(
+            domain_data   = domain,
+            message_types = types,
+            message_data  = message,
+        )
+        sig = signed.signature.hex()
+        if not sig.startswith("0x"):
+            sig = "0x" + sig
+    except Exception as exc:
+        print(f"{_FAIL}  EIP-712 signing failed: {exc}")
+        return
+
+    headers = {
+        "Content-Type":  "application/json",
+        "POLY-ADDRESS":  address,
+        "POLY-SIGNATURE": sig,
+        "POLY-TIMESTAMP": str(ts),
+        "POLY-NONCE":    str(nonce),
+    }
+    print(f"{_INFO}  Calling POST /auth/api-key with L1 signature…")
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.post(
+                f"{CLOB_API}/auth/api-key",
+                headers = headers,
+                timeout = aiohttp.ClientTimeout(total=15),
+            ) as r:
+                body = await r.text()
+                if r.status == 200:
+                    data       = json.loads(body)
+                    api_key    = data.get("apiKey", "")
+                    api_secret = data.get("secret", "")
+                    passphrase = data.get("passphrase", "")
+                    print(f"{_PASS}  New credentials generated!\n")
+                    print("  ┌─ Copy these into /etc/polymarket.env ────────────────")
+                    print(f"  │  POLY_API_KEY={api_key}")
+                    print(f"  │  POLY_API_SECRET={api_secret}")
+                    print(f"  │  POLY_API_PASSPHRASE={passphrase}")
+                    print("  └──────────────────────────────────────────────────────\n")
+                    print("  Then restart the service:")
+                    print("    sudo systemctl restart polymarket")
+                    print("  And re-run the smoke test:")
+                    print("    cd /root && python -m polymarket.smoke_test")
+                else:
+                    print(f"{_FAIL}  POST /auth/api-key returned {r.status}: {body[:400]}")
+        except Exception as exc:
+            print(f"{_FAIL}  Exception: {exc}")
+
+
 if __name__ == "__main__":
-    execute = "--execute" in sys.argv
-    env_arg = next((sys.argv[i+1] for i, a in enumerate(sys.argv)
-                    if a == "--env" and i+1 < len(sys.argv)), None)
+    execute  = "--execute"  in sys.argv
+    rederive = "--rederive" in sys.argv
+    env_arg  = next((sys.argv[i+1] for i, a in enumerate(sys.argv)
+                     if a == "--env" and i+1 < len(sys.argv)), None)
 
     # Load env file (default: /etc/polymarket.env)
     _load_env(env_arg or "/etc/polymarket.env")
+
+    if rederive:
+        asyncio.run(rederive_credentials())
+        sys.exit(0)
 
     if execute:
         print("\033[93mWARNING: --execute flag set. A real $1 order will be submitted.\033[0m")
