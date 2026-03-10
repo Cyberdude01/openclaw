@@ -78,17 +78,28 @@ SNAPSHOT_INTERVAL  = 60      # Write market snapshot to DB every 60 seconds
 # 0 disables the feature (default).
 AUTO_RESTART_HOURS = float(os.getenv("AUTO_RESTART_HOURS", "0"))
 
-# ─── Suppressed Signal Combinations ───────────────────────────────────────────
-# (vol_bucket.value, trend_bucket.value, trigger) tuples that are disabled based
-# on empirical performance analysis.  Signals matching any entry are dropped
-# before reaching the trader.
+# ─── Strategy Version ─────────────────────────────────────────────────────────
+# Set STRATEGY_VERSION env var to select the active trading strategy:
 #
-# ACTIVE per bucket (everything NOT listed here fires normally):
-#   HighVol+Trend : directional_90pct, forced_coin, forced_edge, pre_open, trend_follow
-#   HighVol+Range : directional_90pct, forced_coin, pre_open
-#   LowVol+Trend  : forced_coin, forced_edge, pre_open
-#   LowVol+Range  : forced_coin, forced_edge, pre_open
-SUPPRESSED_SIGNALS: frozenset = frozenset([
+#   v1  Production baseline — forced_coin, forced_edge, pre_open, arb,
+#         directional_90pct (HighVol only), trend_follow (HighVol+Trend)
+#
+#   v2  Trend/Directional focus — same as v1 but forced_coin + forced_edge
+#         fully suppressed; isolates trend_follow + directional_90pct signal
+#
+#   v3  All triggers — minimal suppression; directional_60/80/90pct, forced_coin,
+#         forced_edge, trend_follow, pre_open, arb all fire where applicable
+#
+STRATEGY_VERSION = os.getenv("STRATEGY_VERSION", "v1")
+
+# ─── Suppressed Signal Combinations ───────────────────────────────────────────
+# (vol_bucket.value, trend_bucket.value, trigger) tuples that are disabled.
+# Signals matching any entry are dropped before reaching the trader.
+
+# V1.0 — Production baseline
+# Active: forced_coin, forced_edge, pre_open, arb, directional_90pct (HighVol),
+#         trend_follow (HighVol+Trend)
+_SUPPRESSED_V1: frozenset = frozenset([
     # ── HighVol+Trend ──────────────────────────────────────────────────────
     ("HighVol", "Trend", "directional_60pct"),
     ("HighVol", "Trend", "directional_80pct"),
@@ -109,3 +120,34 @@ SUPPRESSED_SIGNALS: frozenset = frozenset([
     ("LowVol",  "Range", "directional_90pct"),
     ("LowVol",  "Range", "forced"),          # legacy unsplit trigger
 ])
+
+# V2.0 — Trend/Directional focus: same as V1 plus forced_coin + forced_edge
+# fully suppressed across all buckets, isolating trend_follow + directional_90pct
+_SUPPRESSED_V2: frozenset = _SUPPRESSED_V1 | frozenset([
+    ("HighVol", "Trend", "forced_coin"),
+    ("HighVol", "Trend", "forced_edge"),
+    ("HighVol", "Range", "forced_coin"),
+    # forced_edge in HighVol+Range already in V1
+    ("LowVol",  "Trend", "forced_coin"),
+    ("LowVol",  "Trend", "forced_edge"),
+    ("LowVol",  "Range", "forced_coin"),
+    ("LowVol",  "Range", "forced_edge"),
+])
+
+# V3.0 — All triggers: minimal suppression, only legacy "forced" tag disabled
+# Active: pre_open, forced_coin, forced_edge, arb, directional_60/80/90pct,
+#         trend_follow in all applicable buckets
+_SUPPRESSED_V3: frozenset = frozenset([
+    ("HighVol", "Trend", "forced"),
+    ("HighVol", "Range", "forced"),
+    ("LowVol",  "Trend", "forced"),
+    ("LowVol",  "Range", "forced"),
+])
+
+_STRATEGY_SUPPRESSED = {
+    "v1": _SUPPRESSED_V1,
+    "v2": _SUPPRESSED_V2,
+    "v3": _SUPPRESSED_V3,
+}
+
+SUPPRESSED_SIGNALS: frozenset = _STRATEGY_SUPPRESSED.get(STRATEGY_VERSION, _SUPPRESSED_V1)

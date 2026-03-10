@@ -50,6 +50,7 @@ from .config import (
     POLY_API_PASSPHRASE,
     POLY_API_SECRET,
     POLY_PRIVATE_KEY,
+    STRATEGY_VERSION,
 )
 from .database import Database
 from .decision import PositionBook
@@ -330,19 +331,20 @@ class TraderAgent:
         if self.db:
             try:
                 self.db.insert_trade({
-                    "ts":           ts,
-                    "symbol":       signal.symbol,
-                    "condition_id": signal.condition_id,
-                    "token_id":     signal.token_id,
-                    "outcome":      signal.outcome.value,
-                    "side":         signal.side.value,
-                    "size":         signal.size,
-                    "entry_price":  fill_price,
-                    "confidence":   signal.confidence,
-                    "trigger":      signal.trigger,
-                    "reasoning":    signal.reason,
-                    "mode":         mode,
-                    "order_id":     order_id,
+                    "ts":               ts,
+                    "symbol":           signal.symbol,
+                    "condition_id":     signal.condition_id,
+                    "token_id":         signal.token_id,
+                    "outcome":          signal.outcome.value,
+                    "side":             signal.side.value,
+                    "size":             signal.size,
+                    "entry_price":      fill_price,
+                    "confidence":       signal.confidence,
+                    "trigger":          signal.trigger,
+                    "reasoning":        signal.reason,
+                    "mode":             mode,
+                    "order_id":         order_id,
+                    "strategy_version": STRATEGY_VERSION,
                 })
             except Exception:
                 pass  # Never let DB errors interrupt execution

@@ -160,6 +160,7 @@ class Database:
         # Schema migrations (add columns that may not exist in older DBs)
         for migration in [
             "ALTER TABLE market_snapshots ADD COLUMN slug TEXT",
+            "ALTER TABLE trades_executed ADD COLUMN strategy_version TEXT",
         ]:
             try:
                 self._conn.execute(migration)
@@ -206,6 +207,30 @@ class Database:
                 [datetime.now(timezone.utc).isoformat()],
             )
             self._conn.commit()
+        # Initialise stats_start_ts_v1_prod — V1.0 production epoch.
+        # Defaults to the v2 epoch start so the v1_Prod report aligns with v2.
+        if not self._conn.execute(
+            "SELECT 1 FROM settings WHERE key = 'stats_start_ts_v1_prod'"
+        ).fetchone():
+            v2_row = self._conn.execute(
+                "SELECT value FROM settings WHERE key = 'stats_start_ts_v2'"
+            ).fetchone()
+            v1_start = v2_row["value"] if v2_row else datetime.now(timezone.utc).isoformat()
+            self._conn.execute(
+                "INSERT INTO settings (key, value) VALUES ('stats_start_ts_v1_prod', ?)",
+                [v1_start],
+            )
+            self._conn.commit()
+        # Initialise V2.0 (stats_start_ts_v3) and V3.0 (stats_start_ts_v4) dev epochs.
+        for epoch_key in ("stats_start_ts_v3", "stats_start_ts_v4"):
+            if not self._conn.execute(
+                "SELECT 1 FROM settings WHERE key = ?", [epoch_key]
+            ).fetchone():
+                self._conn.execute(
+                    "INSERT INTO settings (key, value) VALUES (?, ?)",
+                    [epoch_key, datetime.now(timezone.utc).isoformat()],
+                )
+                self._conn.commit()
 
     def close(self) -> None:
         self._conn.close()
@@ -311,11 +336,11 @@ class Database:
             [cutoff, limit],
         ).fetchall()
 
-    def all_signals(self, hours: int = 48) -> List[sqlite3.Row]:
+    def all_signals(self, hours: int = 48, limit: int = 200) -> List[sqlite3.Row]:
         cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
         return self._conn.execute(
-            "SELECT * FROM decision_signals WHERE ts >= ? ORDER BY ts DESC",
-            [cutoff],
+            "SELECT * FROM decision_signals WHERE ts >= ? ORDER BY ts DESC LIMIT ?",
+            [cutoff, limit],
         ).fetchall()
 
     def all_trades(self) -> List[sqlite3.Row]:
@@ -472,6 +497,102 @@ class Database:
             ORDER  BY symbol, trigger
             """,
             [start_ts],
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_stats_start_ts_v1_prod(self) -> str:
+        """Return the V1.0 production epoch start timestamp."""
+        row = self._conn.execute(
+            "SELECT value FROM settings WHERE key = 'stats_start_ts_v1_prod'"
+        ).fetchone()
+        return row["value"] if row else datetime.now(timezone.utc).isoformat()
+
+    def get_stats_start_ts_v3(self) -> str:
+        """Return the V2.0 dev strategy epoch start timestamp."""
+        row = self._conn.execute(
+            "SELECT value FROM settings WHERE key = 'stats_start_ts_v3'"
+        ).fetchone()
+        return row["value"] if row else datetime.now(timezone.utc).isoformat()
+
+    def get_stats_start_ts_v4(self) -> str:
+        """Return the V3.0 dev strategy epoch start timestamp."""
+        row = self._conn.execute(
+            "SELECT value FROM settings WHERE key = 'stats_start_ts_v4'"
+        ).fetchone()
+        return row["value"] if row else datetime.now(timezone.utc).isoformat()
+
+    def trigger_stats_for_strategy(
+        self, start_ts: str, strategy: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Trade stats grouped by symbol + trigger, with P&L totals and pending count.
+        Optionally filter by strategy_version.
+        strategy='v1' also includes NULL (legacy trades pre-dating the column).
+        """
+        if strategy == "v1":
+            where = "WHERE ts >= ? AND (strategy_version IS NULL OR strategy_version = 'v1')"
+            params: List = [start_ts]
+        elif strategy:
+            where  = "WHERE ts >= ? AND strategy_version = ?"
+            params = [start_ts, strategy]
+        else:
+            where  = "WHERE ts >= ?"
+            params = [start_ts]
+        rows = self._conn.execute(
+            f"""
+            SELECT symbol,
+                   trigger,
+                   COUNT(*)                                                AS total,
+                   SUM(CASE WHEN result = 'positive'   THEN 1 ELSE 0 END) AS wins,
+                   SUM(CASE WHEN result = 'negative'   THEN 1 ELSE 0 END) AS losses,
+                   SUM(CASE WHEN resolved_at IS NULL    THEN 1 ELSE 0 END) AS pending,
+                   ROUND(SUM(COALESCE(pnl, 0)), 4)                        AS total_pnl,
+                   ROUND(AVG(CASE WHEN result IN ('positive','negative')
+                                  THEN pnl END), 4)                       AS avg_pnl
+            FROM   trades_executed
+            {where}
+            GROUP  BY symbol, trigger
+            ORDER  BY symbol, trigger
+            """,
+            params,
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def market_pnl_summary_for_strategy(
+        self, strategy: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Per-market-window P&L summary, optionally filtered by strategy_version.
+        strategy='v1' includes NULL (legacy trades pre-dating the column).
+        """
+        if strategy == "v1":
+            where = "WHERE (t.strategy_version IS NULL OR t.strategy_version = 'v1')"
+        elif strategy:
+            where = f"WHERE t.strategy_version = '{strategy}'"
+        else:
+            where = ""
+        rows = self._conn.execute(
+            f"""
+            SELECT t.symbol,
+                   t.condition_id,
+                   MIN(t.ts)                                              AS first_trade_ts,
+                   COUNT(*)                                               AS total_trades,
+                   SUM(CASE WHEN t.resolved_at IS NOT NULL THEN 1 ELSE 0 END) AS resolved,
+                   SUM(CASE WHEN t.result = 'positive'     THEN 1 ELSE 0 END) AS wins,
+                   SUM(CASE WHEN t.result = 'negative'     THEN 1 ELSE 0 END) AS losses,
+                   SUM(CASE WHEN t.result = 'arb'          THEN 1 ELSE 0 END) AS arb_trades,
+                   ROUND(SUM(COALESCE(t.pnl, 0)), 4)                      AS total_pnl,
+                   r.winning_outcome,
+                   (SELECT s.slug FROM market_snapshots s
+                    WHERE  s.condition_id = t.condition_id
+                      AND  s.slug IS NOT NULL
+                    LIMIT  1)                                             AS slug
+            FROM   trades_executed t
+            LEFT JOIN market_resolutions r USING (condition_id)
+            {where}
+            GROUP  BY t.symbol, t.condition_id
+            ORDER  BY t.symbol, first_trade_ts DESC
+            """
         ).fetchall()
         return [dict(r) for r in rows]
 
