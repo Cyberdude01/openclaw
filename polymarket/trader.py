@@ -105,11 +105,11 @@ def _l2_headers(method: str, path: str, body: str = "") -> Dict[str, str]:
         hmac.new(secret_bytes, message.encode("utf-8"), hashlib.sha256).digest()
     ).decode("utf-8")
     return {
-        "POLY_ADDRESS":     POLY_ADDRESS,
-        "POLY_SIGNATURE":   sig,
-        "POLY_TIMESTAMP":   ts,
-        "POLY_API_KEY":     POLY_API_KEY,
-        "POLY_PASSPHRASE":  POLY_API_PASSPHRASE,
+        "POLY-ADDRESS":     POLY_ADDRESS,
+        "POLY-SIGNATURE":   sig,
+        "POLY-TIMESTAMP":   ts,
+        "POLY-API-KEY":     POLY_API_KEY,
+        "POLY-PASSPHRASE":  POLY_API_PASSPHRASE,
     }
 
 

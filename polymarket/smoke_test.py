@@ -12,16 +12,19 @@ Stages
   Stage 5  Build a signed EIP-712 order (dry-run by default)
   Stage 6  POST /order  — ONLY runs with --execute flag (REAL MONEY)
 
-Usage
+Usage (both forms work on the production server)
 -----
-  # Dry-run (Stages 1–5 only — no real order, safe to run anytime):
-  python -m polymarket.smoke_test
+  # As a module (from /root):
+  cd /root && python -m polymarket.smoke_test
 
-  # Full end-to-end with a real $1 order (REAL MONEY — be sure before running):
-  python -m polymarket.smoke_test --execute
+  # As a standalone script (from anywhere):
+  python /root/polymarket/smoke_test.py
 
-  # Use a custom env file instead of /etc/polymarket.env:
-  python -m polymarket.smoke_test --env /path/to/my.env
+  # Real $1 order (REAL MONEY):
+  python /root/polymarket/smoke_test.py --execute
+
+  # Custom env file:
+  python /root/polymarket/smoke_test.py --env /path/to/my.env
 
 The script prints a pass/fail summary for each stage so you can pinpoint
 exactly where the live trading pipeline breaks.
@@ -38,6 +41,14 @@ import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional
+
+# ─── Path bootstrap (supports both module and standalone invocation) ───────────
+# When run as `python /root/polymarket/smoke_test.py`, the package root (/root)
+# is not on sys.path automatically.  Add it so absolute imports work.
+_THIS_DIR = Path(__file__).resolve().parent          # /root/polymarket
+_PKG_ROOT  = _THIS_DIR.parent                        # /root
+if str(_PKG_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PKG_ROOT))
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -75,11 +86,11 @@ def _l2_headers(method: str, path: str, body: str = "") -> Dict[str, str]:
         hmac.new(secret_bytes, message.encode("utf-8"), hashlib.sha256).digest()
     ).decode()
     return {
-        "POLY_ADDRESS":    address,
-        "POLY_SIGNATURE":  sig,
-        "POLY_TIMESTAMP":  ts,
-        "POLY_API_KEY":    api_key,
-        "POLY_PASSPHRASE": passphrase,
+        "POLY-ADDRESS":    address,
+        "POLY-SIGNATURE":  sig,
+        "POLY-TIMESTAMP":  ts,
+        "POLY-API-KEY":    api_key,
+        "POLY-PASSPHRASE": passphrase,
     }
 
 
@@ -123,9 +134,24 @@ async def run(execute: bool = False) -> None:
 
         # ── Stage 2: Balance / Auth ───────────────────────────────────────────
         print("\nStage 2 — L2 Auth (GET /balance)")
+        # First verify basic connectivity with a public endpoint
         try:
-            headers = {"Content-Type": "application/json",
-                       **_l2_headers("GET", "/balance")}
+            async with session.get(
+                f"{CLOB_API}/time",
+                timeout=aiohttp.ClientTimeout(total=5),
+            ) as r:
+                if r.status == 200:
+                    print(f"{_INFO}  CLOB connectivity OK (GET /time → 200)")
+                else:
+                    print(f"{_WARN}  CLOB /time returned {r.status} — network issue?")
+        except Exception as exc:
+            print(f"{_WARN}  CLOB /time failed: {exc}")
+
+        try:
+            l2 = _l2_headers("GET", "/balance")
+            headers = {"Content-Type": "application/json", **l2}
+            masked_key = (l2.get("POLY-API-KEY") or "")[:8] + "…"
+            print(f"{_INFO}  Headers: POLY-ADDRESS={l2.get('POLY-ADDRESS','?')[:10]}…  POLY-API-KEY={masked_key}")
             async with session.get(
                 f"{CLOB_API}/balance", headers=headers,
                 timeout=aiohttp.ClientTimeout(total=10),
@@ -136,6 +162,11 @@ async def run(execute: bool = False) -> None:
                     balance = float(data.get("balance") or data.get("USDC") or 0)
                     print(f"{_PASS}  Status 200 — USDC balance: ${balance:.4f}")
                     results["auth_balance"] = "PASS"
+                elif r.status in (401, 403):
+                    print(f"{_FAIL}  Status {r.status}: Auth rejected — credentials invalid or expired")
+                    print(f"{_INFO}  Re-generate API key at polymarket.com → Account → API Keys")
+                    print(f"{_INFO}  Response: {body[:300]}")
+                    results["auth_balance"] = "FAIL"
                 else:
                     print(f"{_FAIL}  Status {r.status}: {body[:300]}")
                     print(f"{_INFO}  Check POLY_API_KEY, POLY_API_SECRET, POLY_API_PASSPHRASE")
