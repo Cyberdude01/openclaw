@@ -143,8 +143,9 @@ def _load_env(path: str) -> None:
             continue
         key, _, val = line.partition("=")
         key = key.strip()
+        val = val.strip().strip('"').strip("'")
         if key and key not in os.environ:
-            os.environ[key] = val.strip()
+            os.environ[key] = val
 
 
 def main() -> None:
