@@ -28,41 +28,42 @@ _PKG_ROOT  = _THIS_DIR.parent
 if str(_PKG_ROOT) not in sys.path:
     sys.path.insert(0, str(_PKG_ROOT))
 
-from polymarket.config import (
-    CLOB_API,
-    DATA_API,
-    GAMMA_API,
-    POLY_ADDRESS,
-    POLY_API_KEY,
-    POLY_API_PASSPHRASE,
-    POLY_API_SECRET,
-)
+from polymarket.config import CLOB_API, DATA_API, GAMMA_API
 
 # ─── Constants ────────────────────────────────────────────────────────────────
-MARKETS_LIMIT   = 20
-FUNDER_ADDRESS  = POLY_ADDRESS
+MARKETS_LIMIT = 20
+
+# Read credentials at call-time so env loaded in main() is picked up
+def _creds() -> Dict[str, str]:
+    return {
+        "address":    os.environ.get("POLY_ADDRESS", ""),
+        "api_key":    os.environ.get("POLY_API_KEY", ""),
+        "api_secret": os.environ.get("POLY_API_SECRET", ""),
+        "passphrase": os.environ.get("POLY_API_PASSPHRASE", ""),
+    }
 
 
 # ─── Auth ─────────────────────────────────────────────────────────────────────
 
 def _l2_headers(method: str, path: str, body: str = "") -> Dict[str, str]:
-    if not POLY_API_KEY or not POLY_API_SECRET:
+    c = _creds()
+    if not c["api_key"] or not c["api_secret"]:
         return {}
     ts      = str(int(time.time()))
     message = ts + method.upper() + path + (body or "")
     try:
-        secret_bytes = base64.b64decode(POLY_API_SECRET)
+        secret_bytes = base64.b64decode(c["api_secret"])
     except Exception:
-        secret_bytes = POLY_API_SECRET.encode()
+        secret_bytes = c["api_secret"].encode()
     sig = base64.b64encode(
         hmac.new(secret_bytes, message.encode("utf-8"), hashlib.sha256).digest()
     ).decode()
     return {
-        "POLY-ADDRESS":    POLY_ADDRESS,
+        "POLY-ADDRESS":    c["address"],
         "POLY-SIGNATURE":  sig,
         "POLY-TIMESTAMP":  ts,
-        "POLY-API-KEY":    POLY_API_KEY,
-        "POLY-PASSPHRASE": POLY_API_PASSPHRASE,
+        "POLY-API-KEY":    c["api_key"],
+        "POLY-PASSPHRASE": c["passphrase"],
     }
 
 
@@ -118,7 +119,7 @@ def get_price(token_id: str) -> Dict[str, float]:
 
 
 def get_positions(address: Optional[str] = None) -> List[Dict[str, Any]]:
-    addr = address or FUNDER_ADDRESS
+    addr = address or _creds()["address"]
     response = requests.get(
         f"{DATA_API}/positions",
         params={"user": addr},
@@ -161,13 +162,25 @@ def main() -> None:
     except Exception as exc:
         print(f"  ERROR: {exc}")
 
-    print("\n=== Active 15-min Markets ===")
-    try:
-        markets = get_markets(tag="crypto")
-        for m in markets[:10]:
-            print(f"  {m.get('slug', '?'):40s}  end={m.get('endDate', '?')[:19]}")
-    except Exception as exc:
-        print(f"  ERROR: {exc}")
+    print("\n=== Active 15-min Crypto Markets ===")
+    for slug in ("btc-updown-15m", "eth-updown-15m", "sol-updown-15m", "xrp-updown-15m"):
+        try:
+            markets = get_markets(slug=slug)
+            if not markets:
+                print(f"  {slug}: no active market")
+                continue
+            m = markets[0]
+            tokens = m.get("tokens", [])
+            up_tok   = next((t for t in tokens if t.get("outcome", "").upper() == "UP"),   None)
+            down_tok = next((t for t in tokens if t.get("outcome", "").upper() == "DOWN"), None)
+            print(f"  {slug}")
+            print(f"    end       : {m.get('endDate', '?')[:19]}")
+            if up_tok:
+                print(f"    UP  token : {up_tok.get('token_id') or up_tok.get('tokenId', '?')}")
+            if down_tok:
+                print(f"    DOWN token: {down_tok.get('token_id') or down_tok.get('tokenId', '?')}")
+        except Exception as exc:
+            print(f"  {slug}: ERROR {exc}")
 
     print("\n=== Positions ===")
     try:
