@@ -163,24 +163,51 @@ def main() -> None:
         print(f"  ERROR: {exc}")
 
     print("\n=== Active 15-min Crypto Markets ===")
-    for slug in ("btc-updown-15m", "eth-updown-15m", "sol-updown-15m", "xrp-updown-15m"):
-        try:
-            markets = get_markets(slug=slug)
-            if not markets:
-                print(f"  {slug}: no active market")
+    now     = int(time.time())
+    current = (now // 900) * 900
+    ts_suffixes = [current, current + 900, current - 900]
+
+    for base_slug in ("btc-updown-15m", "eth-updown-15m", "sol-updown-15m", "xrp-updown-15m"):
+        found = False
+        for ts in ts_suffixes:
+            slug = f"{base_slug}-{ts}"
+            try:
+                r = requests.get(f"{GAMMA_API}/events", params={"slug": slug, "limit": 1}, timeout=10)
+                r.raise_for_status()
+                data = r.json()
+                event = (data[0] if isinstance(data, list) and data
+                         else data if isinstance(data, dict) and data.get("id") else None)
+                if not event:
+                    continue
+                markets = event.get("markets", [])
+                if not markets:
+                    eid = str(event.get("id", ""))
+                    mr = requests.get(f"{GAMMA_API}/markets", params={"event_id": eid, "limit": 20}, timeout=10)
+                    markets = mr.json() if isinstance(mr.json(), list) else []
+                if not markets:
+                    continue
+                m = markets[0]
+                tokens = m.get("tokens") or m.get("clobTokenIds") or []
+                # tokens may be dicts or a JSON string
+                if isinstance(tokens, str):
+                    try:
+                        tokens = json.loads(tokens)
+                    except Exception:
+                        tokens = []
+                up_tok   = next((t for t in tokens if isinstance(t, dict) and t.get("outcome", "").upper() == "UP"),   None)
+                down_tok = next((t for t in tokens if isinstance(t, dict) and t.get("outcome", "").upper() == "DOWN"), None)
+                print(f"  {slug}")
+                print(f"    end       : {m.get('endDate', '?')[:19]}")
+                if up_tok:
+                    print(f"    UP  token : {up_tok.get('token_id') or up_tok.get('tokenId', '?')}")
+                if down_tok:
+                    print(f"    DOWN token: {down_tok.get('token_id') or down_tok.get('tokenId', '?')}")
+                found = True
+                break
+            except Exception as exc:
                 continue
-            m = markets[0]
-            tokens = m.get("tokens", [])
-            up_tok   = next((t for t in tokens if t.get("outcome", "").upper() == "UP"),   None)
-            down_tok = next((t for t in tokens if t.get("outcome", "").upper() == "DOWN"), None)
-            print(f"  {slug}")
-            print(f"    end       : {m.get('endDate', '?')[:19]}")
-            if up_tok:
-                print(f"    UP  token : {up_tok.get('token_id') or up_tok.get('tokenId', '?')}")
-            if down_tok:
-                print(f"    DOWN token: {down_tok.get('token_id') or down_tok.get('tokenId', '?')}")
-        except Exception as exc:
-            print(f"  {slug}: ERROR {exc}")
+        if not found:
+            print(f"  {base_slug}: no active market")
 
     print("\n=== Positions ===")
     try:
