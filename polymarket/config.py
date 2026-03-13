@@ -28,8 +28,6 @@ SYMBOL_MAP = {
 # ─── Market Timing ────────────────────────────────────────────────────────────
 MARKET_DURATION_SECONDS = 15 * 60   # 15 minutes in seconds
 DECISION_THRESHOLDS = {             # % of market elapsed → predict direction
-    "60pct": 0.60,                  # 9 min
-    "80pct": 0.80,                  # 12 min
     "90pct": 0.90,                  # 13.5 min
 }
 
@@ -87,9 +85,6 @@ AUTO_RESTART_HOURS = float(os.getenv("AUTO_RESTART_HOURS", "0"))
 #   v2  Trend/Directional focus — same as v1 but forced_coin + forced_edge
 #         fully suppressed; isolates trend_follow + directional_90pct signal
 #
-#   v3  All triggers — minimal suppression; directional_60/80/90pct, forced_coin,
-#         forced_edge, trend_follow, pre_open, arb all fire where applicable
-#
 STRATEGY_VERSION = os.getenv("STRATEGY_VERSION", "v1")
 
 # ─── Suppressed Signal Combinations ───────────────────────────────────────────
@@ -101,22 +96,14 @@ STRATEGY_VERSION = os.getenv("STRATEGY_VERSION", "v1")
 #         trend_follow (HighVol+Trend)
 _SUPPRESSED_V1: frozenset = frozenset([
     # ── HighVol+Trend ──────────────────────────────────────────────────────
-    ("HighVol", "Trend", "directional_60pct"),
-    ("HighVol", "Trend", "directional_80pct"),
     ("HighVol", "Trend", "forced"),          # legacy unsplit trigger
     # ── HighVol+Range ──────────────────────────────────────────────────────
-    ("HighVol", "Range", "directional_60pct"),
-    ("HighVol", "Range", "directional_80pct"),
     ("HighVol", "Range", "forced"),          # legacy unsplit trigger
     ("HighVol", "Range", "forced_edge"),
     # ── LowVol+Trend ───────────────────────────────────────────────────────
-    ("LowVol",  "Trend", "directional_60pct"),
-    ("LowVol",  "Trend", "directional_80pct"),
     ("LowVol",  "Trend", "directional_90pct"),
     ("LowVol",  "Trend", "forced"),          # legacy unsplit trigger
     # ── LowVol+Range ───────────────────────────────────────────────────────
-    ("LowVol",  "Range", "directional_60pct"),
-    ("LowVol",  "Range", "directional_80pct"),
     ("LowVol",  "Range", "directional_90pct"),
     ("LowVol",  "Range", "forced"),          # legacy unsplit trigger
 ])
@@ -134,20 +121,9 @@ _SUPPRESSED_V2: frozenset = _SUPPRESSED_V1 | frozenset([
     ("LowVol",  "Range", "forced_edge"),
 ])
 
-# V3.0 — All triggers: minimal suppression, only legacy "forced" tag disabled
-# Active: pre_open, forced_coin, forced_edge, arb, directional_60/80/90pct,
-#         trend_follow in all applicable buckets
-_SUPPRESSED_V3: frozenset = frozenset([
-    ("HighVol", "Trend", "forced"),
-    ("HighVol", "Range", "forced"),
-    ("LowVol",  "Trend", "forced"),
-    ("LowVol",  "Range", "forced"),
-])
-
 _STRATEGY_SUPPRESSED = {
     "v1": _SUPPRESSED_V1,
     "v2": _SUPPRESSED_V2,
-    "v3": _SUPPRESSED_V3,
 }
 
 SUPPRESSED_SIGNALS: frozenset = _STRATEGY_SUPPRESSED.get(STRATEGY_VERSION, _SUPPRESSED_V1)

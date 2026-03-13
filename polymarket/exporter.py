@@ -578,8 +578,6 @@ class DataExporter:
         "forced_coin",
         "forced_edge",
         "arb",
-        "directional_60pct",
-        "directional_80pct",
         "directional_90pct",
         "trend_follow",
     ]
@@ -1018,15 +1016,7 @@ class DataExporter:
             _row(["[Decision Tracker](reports/decision_tracker.md)",
                   "Full trade history with entry, resolution and P&L"]),
             _row(["[Trigger Summary](reports/trigger_summary.md)",
-                  "UP/DOWN trades, wins and losses by trigger (current epoch only)"]),
-            _row(["[Trigger Summary v2](reports/trigger_summary_v2.md)",
-                  "Trigger P&L by symbol — fresh epoch, clean baseline"]),
-            _row(["[**V1.0 Prod** Trigger Summary](reports/trigger_summary_v1_Prod.md)",
-                  "V1.0 Production — ring-fenced trigger performance"]),
-            _row(["[**V2.0 Dev** Trigger Summary](reports/trigger_summary_v3.md)",
-                  "V2.0 Dev — trend_follow + directional_90pct focus (forced suppressed)"]),
-            _row(["[**V3.0 Dev** Trigger Summary](reports/trigger_summary_v4.md)",
-                  "V3.0 Dev — all triggers active"]),
+                  "UP/DOWN trades, wins and losses by trigger"]),
             _row(["[Market P&L](reports/market_pnl.md)",
                   "Bets and P&L per market window, grouped by symbol"]),
             _row(["[**V1.0 Prod** Market P&L](reports/market_V1_pnl.md)",
@@ -1133,10 +1123,6 @@ class DataExporter:
             self._write_report(r / "decision_summary.md",       self._build_decision_summary_report(ts))
             self._write_report(r / "decision_tracker.md",       self._build_decision_tracker_report(ts))
             self._write_report(r / "trigger_summary.md",        self._build_trigger_summary_report(ts))
-            self._write_report(r / "trigger_summary_v2.md",     self._build_trigger_summary_v2_report(ts))
-            self._write_report(r / "trigger_summary_v1_Prod.md",self._build_trigger_summary_v1_prod_report(ts))
-            self._write_report(r / "trigger_summary_v3.md",     self._build_trigger_summary_v3_report(ts))
-            self._write_report(r / "trigger_summary_v4.md",     self._build_trigger_summary_v4_report(ts))
             self._write_report(r / "market_pnl.md",             self._build_market_pnl_report(ts))
             self._write_report(r / "market_V1_pnl.md",          self._build_market_v1_pnl_report(ts))
 

@@ -437,10 +437,6 @@ class DecisionEngine:
             if self.adaptive and self.adaptive.is_suppressed("trend_follow", outcome.value):
                 continue
 
-            # Opposing-entry guard: don't bet both sides of the same window
-            if self.adaptive and self.adaptive.opposing_entry_exists(mkt.condition_id, outcome.value):
-                continue
-
             price = getattr(token.order_book, price_attr, 0.5)
             size  = min(TRADE_SIZE, MAX_POSITION - self.book.total_exposure(symbol))
             if size < MIN_TRADE_SIZE:
