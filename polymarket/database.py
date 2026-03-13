@@ -349,6 +349,44 @@ class Database:
             [cutoff, limit],
         ).fetchall()
 
+    def all_signals_with_resolution(self, hours: int = 48, limit: int = 500) -> List[sqlite3.Row]:
+        """Signals joined with market_resolutions to expose win/loss per decision."""
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+        return self._conn.execute(
+            """
+            SELECT s.*,
+                   r.winning_outcome AS market_winner,
+                   r.resolved_at     AS resolved_at,
+                   CASE
+                     WHEN r.winning_outcome IS NULL          THEN 'pending'
+                     WHEN s.outcome = r.winning_outcome      THEN 'win'
+                     ELSE                                         'loss'
+                   END AS signal_result
+            FROM   decision_signals s
+            LEFT JOIN market_resolutions r USING (condition_id)
+            WHERE  s.ts >= ?
+            ORDER  BY s.ts DESC
+            LIMIT  ?
+            """,
+            [cutoff, limit],
+        ).fetchall()
+
+    def signal_summary(self) -> dict:
+        """Aggregate win/loss counts across all signals with resolved outcomes."""
+        row = self._conn.execute(
+            """
+            SELECT COUNT(*)                                                        AS total,
+                   SUM(CASE WHEN r.winning_outcome IS NOT NULL      THEN 1 END)   AS resolved,
+                   SUM(CASE WHEN s.outcome = r.winning_outcome      THEN 1 END)   AS wins,
+                   SUM(CASE WHEN r.winning_outcome IS NOT NULL
+                             AND s.outcome != r.winning_outcome      THEN 1 END)  AS losses,
+                   SUM(CASE WHEN r.winning_outcome IS NULL           THEN 1 END)  AS pending
+            FROM   decision_signals s
+            LEFT JOIN market_resolutions r USING (condition_id)
+            """
+        ).fetchone()
+        return dict(row) if row else {}
+
     def all_trades(self) -> List[sqlite3.Row]:
         """All trades joined with resolution data and market window timestamps."""
         return self._conn.execute(
