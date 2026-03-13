@@ -475,8 +475,9 @@ class DecisionEngine:
         Direction is chosen by whichever side has the higher probability estimate.
         Size is always TRADE_SIZE ($5).
         """
-        # Only fire within 30 s of the 60% threshold
-        delta = abs(mkt.elapsed_pct - DECISION_THRESHOLDS["60pct"])
+        # Only fire within 30 s of the 60% mark (independent of directional thresholds)
+        _FORCED_ELAPSED = 0.60
+        delta = abs(mkt.elapsed_pct - _FORCED_ELAPSED)
         if delta > (30 / MARKET_DURATION_SECONDS):
             return []
 
