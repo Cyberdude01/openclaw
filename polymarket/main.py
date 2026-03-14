@@ -257,6 +257,28 @@ async def _api_resolution_loop(db: Database) -> None:
                 """
             ).fetchall()
 
+            # Also resolve condition IDs that appear in decision_signals but have
+            # no market_resolutions entry yet (signals with no executed trade).
+            sig_rows = db._conn.execute(
+                """
+                SELECT DISTINCT s.condition_id,
+                       s.symbol,
+                       MIN(s.ts)  AS first_trade_ts,
+                       (SELECT ms.token_id_up FROM market_snapshots ms
+                        WHERE  ms.condition_id = s.condition_id
+                          AND  ms.token_id_up IS NOT NULL
+                        LIMIT 1) AS token_id_up
+                FROM   decision_signals s
+                LEFT   JOIN market_resolutions r USING (condition_id)
+                WHERE  r.condition_id IS NULL
+                GROUP  BY s.condition_id
+                """
+            ).fetchall()
+
+            # Merge, deduplicating by condition_id (trades row takes precedence)
+            seen_cids = {r["condition_id"] for r in rows}
+            rows = list(rows) + [r for r in sig_rows if r["condition_id"] not in seen_cids]
+
             if not rows:
                 continue
 
